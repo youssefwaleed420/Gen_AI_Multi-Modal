@@ -1,1 +1,1 @@
-# lightning.ai
+# Gen_AI_Multi-Modal
