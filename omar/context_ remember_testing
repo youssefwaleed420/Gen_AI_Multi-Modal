@@ -1,0 +1,191 @@
+from typing import Annotated
+from typing_extensions import TypedDict
+from langgraph.graph import StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.checkpoint.memory import InMemorySaver
+
+from langchain_core.messages import HumanMessage, AIMessage
+import requests
+import json
+import re
+
+# === Step 1: Define LangGraph State ===
+class State(TypedDict):
+    messages: Annotated[list, add_messages]  # append messages instead of overwriting
+
+graph_builder = StateGraph(State)
+
+# === Step 2: Define Ollama model call ===
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "llama3.2:1b"  # Using default llama3 model (better than llama3.2:1b)
+
+def call_ollama(prompt: str) -> str:
+    """Call Ollama API with the given prompt and return the response."""
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.7,
+                    "top_p": 0.9,
+                    "repeat_penalty": 1.1  # Helps prevent repetition
+                }
+            },
+            timeout=30
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data.get("response", "").strip()
+    except requests.exceptions.RequestException as e:
+        print(f"Error calling Ollama: {e}")
+        return "I encountered an error while processing your request."
+    except json.JSONDecodeError as e:
+        print(f"Error decoding Ollama response: {e}")
+        return "I had trouble understanding the response from the AI model."
+
+# === Step 3: Chatbot node with improved prompt handling ===
+def extract_name(text: str) -> str:
+    """Extract name from user message if mentioned."""
+    name_patterns = [
+        r"my name is ([A-Za-z]+)",
+        r"i'm ([A-Za-z]+)",
+        r"call me ([A-Za-z]+)"
+    ]
+    for pattern in name_patterns:
+        match = re.search(pattern, text.lower())
+        if match:
+            return match.group(1).capitalize()
+    return None
+
+def build_prompt(messages: list, user_name: str = None) -> str:
+    """Build a clean prompt with limited history and system instructions."""
+    system_prompt = (
+        "You are a helpful, friendly AI assistant. "
+        f"{f'The user\'s name is {user_name}.' if user_name else ''} "
+        "Keep responses concise and relevant to the conversation."
+    )
+    
+    # Only keep last 6 messages to prevent prompt bloat
+    recent_messages = messages[-6:]
+    
+    conversation = []
+    for msg in recent_messages:
+        if isinstance(msg, dict):
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+        else:
+            role = "user" if isinstance(msg, HumanMessage) else "assistant"
+            content = getattr(msg, "content", "")
+        
+        if content.strip():
+            conversation.append(f"{role.capitalize()}: {content}")
+    
+    return f"{system_prompt}\n\n" + "\n".join(conversation) + "\nAssistant:"
+
+def chatbot(state: State):
+    """Process conversation history and generate a response."""
+    try:
+        messages = state.get("messages", [])
+        user_name = None
+        
+        # Extract and track user's name
+        for msg in messages:
+            if isinstance(msg, HumanMessage):
+                name = extract_name(msg.content)
+                if name:
+                    user_name = name
+        
+        prompt = build_prompt(messages, user_name)
+        response = call_ollama(prompt)
+        
+        # Handle name recall specifically
+        last_user_msg = next(
+            (msg for msg in reversed(messages) if isinstance(msg, HumanMessage)),
+            None
+        )
+        if last_user_msg and "my name" in last_user_msg.content.lower():
+            if user_name:
+                response = f"Your name is {user_name}!"
+            else:
+                response = "I don't recall you telling me your name yet."
+        
+        return {"messages": [AIMessage(content=response)]}
+    except Exception as e:
+        print(f"Error in chatbot node: {e}")
+        return {"messages": [AIMessage(content="Sorry, I encountered an error.")]}
+
+# === Step 4: Build the graph ===
+graph_builder.add_node("chatbot", chatbot)
+graph_builder.set_entry_point("chatbot")
+graph_builder.set_finish_point("chatbot")
+
+# === Step 5: Compile graph with memory ===
+memory = InMemorySaver()
+graph = graph_builder.compile(checkpointer=memory)
+
+# === Step 6: Optimized stream responses ===
+def stream_graph_updates(user_input: str, thread_id: str = "1"):
+    """Process user input and stream the chatbot's response."""
+    config = {"configurable": {"thread_id": thread_id}}
+    user_message = HumanMessage(content=user_input.strip())
+    
+    try:
+        events = graph.stream(
+            {"messages": [user_message]},
+            config,
+            stream_mode="values",
+        )
+        
+        # Collect all responses and yield the final one
+        responses = []
+        for event in events:
+            for node, messages in event.items():
+                if isinstance(messages, list) and messages:
+                    last_msg = messages[-1]
+                    content = last_msg.content if hasattr(last_msg, "content") else last_msg.get("content", "")
+                    if content.strip():
+                        responses.append(content)
+        
+        if responses:
+            yield responses[-1]  # Only yield the final response
+            
+    except Exception as e:
+        print(f"Error in streaming: {e}")
+        yield "Sorry, I encountered an error."
+
+# === Step 7: Enhanced chat loop ===
+def main():
+    print("Welcome to the Ollama chatbot! (Type 'exit' to quit)")
+    thread_id = input("Enter a thread ID for this conversation (default is '1'): ") or "1"
+    
+    print("\nStarting conversation...\n")
+    
+    while True:
+        try:
+            user_input = input("You: ").strip()
+            if not user_input:
+                continue
+                
+            if user_input.lower() in ["exit", "quit", "q"]:
+                print("\nGoodbye!")
+                break
+                
+            print("\nAssistant: ", end="", flush=True)
+            
+            for response in stream_graph_updates(user_input, thread_id):
+                print(response, end="", flush=True)
+                
+            print("\n")  # Add spacing after each response
+            
+        except KeyboardInterrupt:
+            print("\n\nGoodbye!")
+            break
+        except Exception as e:
+            print(f"\nError: {str(e)}")
+            continue
+
+if __name__ == "__main__":
+    main()
