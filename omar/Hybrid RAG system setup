@@ -1,0 +1,963 @@
+# === HYBRID RAG SYSTEM: VECTOR + GRAPH ===
+from adb_cloud_connector import get_temp_credentials
+from arango import ArangoClient
+from arango.exceptions import CollectionCreateError, EdgeDefinitionCreateError
+import fitz  # PyMuPDF
+import voyageai 
+import requests
+import json
+import time
+import re
+from tqdm import tqdm
+from pyvis.network import Network
+import webbrowser
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+import hashlib
+from typing import List, Dict, Tuple, Optional, Any
+
+# Initialize Voyage client for embeddings
+VOYAGE_API_KEY = "pa-tDh9PAJmIfaPahq1-GkuSk8uVNGrI69sq3uxpiGK8Y7"
+voyage_client = voyageai.Client(api_key=VOYAGE_API_KEY)
+
+# === ARANGODB SETUP WITH VECTOR SUPPORT ===
+print("Initializing ArangoDB connection...")
+connection = get_temp_credentials(tutorialName="LangChain")
+client = ArangoClient(hosts=connection["url"])
+db = client.db(connection["dbName"], connection["username"], connection["password"], verify=True)
+
+# Thread lock for database operations
+db_lock = threading.Lock()
+
+def setup_hybrid_database():
+    """Setup database collections for hybrid RAG with vector support"""
+    try:
+        # Clean up existing collections
+        collections_to_delete = ['pdf_knowledge_graph', 'relationships', 'entities', 'document_chunks', 'embeddings']
+        for coll_name in collections_to_delete:
+            if db.has_graph(coll_name):
+                db.delete_graph(coll_name, drop_collections=True)
+            if db.has_collection(coll_name):
+                db.delete_collection(coll_name)
+        
+        # Create core collections
+        entities = db.create_collection('entities')
+        relationships = db.create_collection('relationships', edge=True)
+        
+        # Create new collections for hybrid RAG
+        document_chunks = db.create_collection('document_chunks')  # Store text chunks
+        embeddings = db.create_collection('embeddings')  # Store vector embeddings
+        
+        # Create graph
+        knowledge_graph = db.create_graph('pdf_knowledge_graph')
+        knowledge_graph.create_edge_definition(
+            edge_collection='relationships',
+            from_vertex_collections=['entities'],
+            to_vertex_collections=['entities']
+        )
+        
+        print("Hybrid RAG database setup complete!")
+        return entities, relationships, document_chunks, embeddings, knowledge_graph
+        
+    except Exception as e:
+        print(f"Database setup error: {str(e)}")
+        raise
+
+entities, relationships, document_chunks, embeddings, knowledge_graph = setup_hybrid_database()
+
+# === VECTOR EMBEDDING UTILITIES ===
+class VectorEmbeddings:
+    def __init__(self):
+        self.cache = {}  # Simple in-memory cache for embeddings
+        
+    def get_embedding(self, text: str, model: str = "voyage-3") -> Optional[List[float]]:
+        """Get embedding for text with caching"""
+        if not text or not text.strip():
+            return None
+            
+        # Create cache key
+        cache_key = hashlib.md5(text.encode()).hexdigest()
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+        
+        try:
+            # Get embedding from Voyage AI
+            response = voyage_client.embed([text], model=model)
+            if response.embeddings and len(response.embeddings) > 0:
+                embedding = response.embeddings[0]
+                self.cache[cache_key] = embedding
+                return embedding
+        except Exception as e:
+            print(f"Embedding error: {str(e)}")
+        
+        return None
+    
+    def get_embeddings_batch(self, texts: List[str], model: str = "voyage-3") -> List[Optional[List[float]]]:
+        """Get embeddings for multiple texts efficiently"""
+        if not texts:
+            return []
+        
+        # Filter out empty texts and track indices
+        valid_texts = []
+        valid_indices = []
+        results = [None] * len(texts)
+        
+        for i, text in enumerate(texts):
+            if text and text.strip():
+                cache_key = hashlib.md5(text.encode()).hexdigest()
+                if cache_key in self.cache:
+                    results[i] = self.cache[cache_key]
+                else:
+                    valid_texts.append(text)
+                    valid_indices.append(i)
+        
+        # Get embeddings for non-cached texts
+        if valid_texts:
+            try:
+                response = voyage_client.embed(valid_texts, model=model)
+                if response.embeddings:
+                    for idx, embedding in zip(valid_indices, response.embeddings):
+                        results[idx] = embedding
+                        # Cache the result
+                        cache_key = hashlib.md5(texts[idx].encode()).hexdigest()
+                        self.cache[cache_key] = embedding
+            except Exception as e:
+                print(f"Batch embedding error: {str(e)}")
+        
+        return results
+
+# Initialize embedding handler
+embedding_handler = VectorEmbeddings()
+
+# === ENHANCED TEXT PROCESSING ===
+def chunk_text_with_overlap(text: str, max_chars: int = 1500, overlap: int = 200) -> List[Dict]:
+    """Split text into overlapping chunks with metadata"""
+    if not text or len(text) <= max_chars:
+        return [{"text": text, "start": 0, "end": len(text), "chunk_id": 0, "length": len(text)}] if text else []
+
+    chunks = []
+    start = 0
+    chunk_id = 0
+
+    while start < len(text):
+        end = min(start + max_chars, len(text))
+
+        # Try to end at sentence boundary
+        if end < len(text):
+            sentence_end = text.rfind('.', start, end)
+            if sentence_end > start + max_chars // 2:
+                end = sentence_end + 1  # Include the period
+
+        chunk_text = text[start:end].strip()
+        if chunk_text:
+            chunks.append({
+                "text": chunk_text,
+                "start": start,
+                "end": end,
+                "chunk_id": chunk_id,
+                "length": len(chunk_text)
+            })
+            chunk_id += 1
+
+        # Move start forward with overlap
+        start = end - overlap
+
+    return chunks
+
+def call_qwen_api_enhanced(text_chunk: str, max_retries: int = 3) -> Optional[Dict]:
+    """Enhanced Qwen API call with better prompting for entity extraction"""
+    prompt = f"""
+    Extract technical components, concepts, and their relationships from this text.
+    Focus on: systems, methods, technologies, specifications, parameters, and their connections.
+    
+    Return ONLY valid JSON with this exact structure:
+    {{
+        "entities": [
+            {{
+                "name": "exact_component_name",
+                "type": "category_type",
+                "properties": {{"description": "brief_description", "context": "usage_context"}}
+            }}
+        ],
+        "relationships": [
+            {{
+                "source": "source_entity_name",
+                "target": "target_entity_name", 
+                "type": "relationship_type",
+                "description": "relationship_context"
+            }}
+        ]
+    }}
+    
+    Text: {text_chunk[:1200]}
+    """
+    
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(
+                "http://localhost:11434/api/generate",
+                json={
+                    "model": "llama3.2:1b",
+                    "prompt": prompt,
+                    "stream": False,
+                    "format": "json",
+                    "options": {
+                        "temperature": 0.1,
+                        "timeout": 20,
+                        "num_ctx": 2048
+                    }
+                },
+                timeout=25
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if 'response' in data:
+                    if isinstance(data['response'], str):
+                        return json.loads(data['response'])
+                    else:
+                        return data['response']
+                        
+        except requests.exceptions.Timeout:
+            print(f"Timeout on attempt {attempt + 1}")
+            if attempt < max_retries - 1:
+                time.sleep(1)
+        except json.JSONDecodeError as e:
+            print(f"JSON decode error on attempt {attempt + 1}: {str(e)}")
+        except Exception as e:
+            print(f"API error on attempt {attempt + 1}: {str(e)}")
+    
+    return None
+
+def safe_key(name: str) -> Optional[str]:
+    """Generate safe database key"""
+    if not name:
+        return None
+    key = re.sub(r'[^a-zA-Z0-9_]', '_', str(name))[:64]
+    return key if key and not key[0].isdigit() else f"k_{key}"
+
+# === HYBRID RAG PROCESSING ===
+def process_text_chunk_hybrid(chunk_data: Tuple[Dict, int]) -> Tuple[List[Dict], List[Dict], Dict]:
+    """Process text chunk for both graph and vector storage"""
+    chunk_info, page_num = chunk_data
+    chunk_text = chunk_info["text"]
+    chunk_id = chunk_info["chunk_id"]
+    
+    local_entities = []
+    local_relationships = []
+    chunk_doc = None
+    
+    try:
+        # 1. Get embedding for the chunk
+        embedding = embedding_handler.get_embedding(chunk_text)
+        
+        # 2. Create document chunk record
+        chunk_key = f"chunk_{page_num}_{chunk_id}"
+        chunk_doc = {
+            '_key': chunk_key,
+            'text': chunk_text,
+            'page_number': page_num,
+            'chunk_id': chunk_id,
+            'start_pos': chunk_info.get('start', 0),
+            'end_pos': chunk_info.get('end', len(chunk_text)),
+            'length': len(chunk_text),
+            'has_embedding': embedding is not None
+        }
+        
+        # 3. Extract entities and relationships using LLM
+        structured_data = call_qwen_api_enhanced(chunk_text)
+        if structured_data:
+            # Process entities
+            for entity in structured_data.get('entities', []):
+                if not isinstance(entity, dict) or 'name' not in entity:
+                    continue
+                    
+                entity_key = safe_key(entity['name'])
+                if not entity_key:
+                    continue
+                
+                entity_doc = {
+                    '_key': entity_key,
+                    'name': entity['name'][:100],
+                    'type': entity.get('type', 'component')[:50],
+                    'properties': entity.get('properties', {}),
+                    'source_page': page_num,
+                    'source_chunks': [chunk_key],  # Track which chunks mention this entity
+                    'first_mentioned_chunk': chunk_key
+                }
+                local_entities.append(entity_doc)
+            
+            # Process relationships
+            entity_names = {e['name'] for e in local_entities}
+            for rel in structured_data.get('relationships', []):
+                if not all(k in rel for k in ['source', 'target']):
+                    continue
+                
+                if rel['source'] in entity_names and rel['target'] in entity_names:
+                    source_key = safe_key(rel['source'])
+                    target_key = safe_key(rel['target'])
+                    
+                    if source_key and target_key and source_key != target_key:
+                        rel_doc = {
+                            '_from': f"entities/{source_key}",
+                            '_to': f"entities/{target_key}",
+                            'type': rel.get('type', 'related_to')[:50],
+                            'description': rel.get('description', '')[:200],
+                            'source_page': page_num,
+                            'source_chunk': chunk_key
+                        }
+                        local_relationships.append(rel_doc)
+        
+        # 4. Store embedding separately if available
+        if embedding:
+            embedding_doc = {
+                '_key': f"emb_{chunk_key}",
+                'chunk_key': chunk_key,
+                'embedding': embedding,
+                'text_preview': chunk_text[:200],
+                'page_number': page_num,
+                'created_at': time.time()
+            }
+            
+            with db_lock:
+                try:
+                    embeddings.insert(embedding_doc)
+                except Exception as e:
+                    print(f"Embedding insert error: {str(e)}")
+                    
+    except Exception as e:
+        print(f"Error processing chunk {chunk_id} from page {page_num}: {str(e)}")
+    
+    return local_entities, local_relationships, chunk_doc
+
+def batch_insert_hybrid(entity_batch: List[Dict], rel_batch: List[Dict], chunk_batch: List[Dict]):
+    """Insert entities, relationships, and chunks in batch"""
+    inserted_counts = {'entities': 0, 'relationships': 0, 'chunks': 0}
+    
+    with db_lock:
+        # Insert chunks first
+        for chunk in chunk_batch:
+            if chunk:
+                try:
+                    document_chunks.insert(chunk)
+                    inserted_counts['chunks'] += 1
+                except Exception as e:
+                    print(f"Chunk insert error: {str(e)}")
+        
+        # Insert/update entities
+        for entity in entity_batch:
+            try:
+                if not entities.has(entity['_key']):
+                    entities.insert(entity)
+                    inserted_counts['entities'] += 1
+                else:
+                    # Update existing entity
+                    existing = entities.get(entity['_key'])
+                    existing['properties'].update(entity.get('properties', {}))
+                    # Merge source chunks
+                    existing_chunks = set(existing.get('source_chunks', []))
+                    new_chunks = set(entity.get('source_chunks', []))
+                    existing['source_chunks'] = list(existing_chunks.union(new_chunks))
+                    entities.update(existing)
+            except Exception as e:
+                print(f"Entity insert error: {str(e)}")
+        
+        # Insert relationships
+        for rel in rel_batch:
+            try:
+                source_key = rel['_from'].split('/')[1]
+                target_key = rel['_to'].split('/')[1]
+                
+                if entities.has(source_key) and entities.has(target_key):
+                    relationships.insert(rel)
+                    inserted_counts['relationships'] += 1
+            except Exception as e:
+                print(f"Relationship insert error: {str(e)}")
+    
+    return inserted_counts
+
+def extract_and_structure_pdf_hybrid(pdf_path: str):
+    """Process PDF for hybrid RAG system"""
+    print(f"\nProcessing PDF for Hybrid RAG: {pdf_path}")
+    
+    try:
+        pdf_document = fitz.open(pdf_path)
+        total_pages = len(pdf_document)
+        
+        total_counts = {'entities': 0, 'relationships': 0, 'chunks': 0}
+        
+        # Collect all text chunks with metadata
+        all_chunks = []
+        for page_num in range(total_pages):
+            try:
+                page = pdf_document.load_page(page_num)
+                text = page.get_text()
+                
+                if not text.strip():
+                    continue
+                
+                # Clean text
+                text = re.sub(r'\s+', ' ', text).strip()
+                
+                # Create overlapping chunks
+                chunks = chunk_text_with_overlap(text, max_chars=1200, overlap=150)
+                for chunk_info in chunks:
+                    if chunk_info["text"].strip():
+                        all_chunks.append((chunk_info, page_num + 1))
+                        
+            except Exception as e:
+                print(f"Error reading page {page_num + 1}: {str(e)}")
+        
+        pdf_document.close()
+        
+        if not all_chunks:
+            print("No text content found in PDF")
+            return total_counts
+        
+        print(f"Processing {len(all_chunks)} text chunks with hybrid approach...")
+        
+        # Process chunks in batches
+        batch_size = 3  # Smaller batches to manage memory and API limits
+        
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            for i in tqdm(range(0, len(all_chunks), batch_size), desc="Processing hybrid batches"):
+                batch = all_chunks[i:i+batch_size]
+                
+                # Process batch
+                futures = [executor.submit(process_text_chunk_hybrid, chunk_data) for chunk_data in batch]
+                
+                entity_batch = []
+                rel_batch = []
+                chunk_batch = []
+                
+                for future in as_completed(futures):
+                    try:
+                        chunk_entities, chunk_rels, chunk_doc = future.result()
+                        entity_batch.extend(chunk_entities)
+                        rel_batch.extend(chunk_rels)
+                        if chunk_doc:
+                            chunk_batch.append(chunk_doc)
+                    except Exception as e:
+                        print(f"Chunk processing error: {str(e)}")
+                
+                # Insert batch results
+                if entity_batch or rel_batch or chunk_batch:
+                    counts = batch_insert_hybrid(entity_batch, rel_batch, chunk_batch)
+                    for key in total_counts:
+                        total_counts[key] += counts[key]
+                
+                # Brief pause between batches
+                time.sleep(0.5)
+        
+        print(f"\nHybrid PDF processing complete!")
+        print(f"Extracted: {total_counts['entities']} entities, {total_counts['relationships']} relationships, {total_counts['chunks']} chunks")
+        return total_counts
+        
+    except Exception as e:
+        print(f"Failed to process PDF: {str(e)}")
+        return {'entities': 0, 'relationships': 0, 'chunks': 0}
+
+# === HYBRID RAG QUERY SYSTEM ===
+class HybridRAG:
+    def __init__(self, db):
+        self.db = db
+        self.embedding_handler = embedding_handler
+        self.visualization_file = "hybrid_knowledge_graph.html"
+        
+    def get_stats(self) -> Dict[str, int]:
+        """Get comprehensive database statistics"""
+        try:
+            stats = {
+                'entities': self.db.collection('entities').count(),
+                'relationships': self.db.collection('relationships').count(), 
+                'chunks': self.db.collection('document_chunks').count(),
+                'embeddings': self.db.collection('embeddings').count()
+            }
+            return stats
+        except:
+            return {'entities': 0, 'relationships': 0, 'chunks': 0, 'embeddings': 0}
+    
+    def vector_search(self, query: str, top_k: int = 5) -> List[Dict]:
+        """Perform semantic vector search"""
+        try:
+            # Get query embedding
+            query_embedding = self.embedding_handler.get_embedding(query)
+            if not query_embedding:
+                return []
+            
+            # Get all embeddings from database
+            cursor = self.db.aql.execute(
+                "FOR emb IN embeddings RETURN emb"
+            )
+            
+            embeddings_data = list(cursor)
+            if not embeddings_data:
+                return []
+            
+            # Calculate cosine similarities
+            similarities = []
+            query_vec = np.array(query_embedding).reshape(1, -1)
+            
+            for emb_doc in embeddings_data:
+                try:
+                    doc_vec = np.array(emb_doc['embedding']).reshape(1, -1)
+                    similarity = cosine_similarity(query_vec, doc_vec)[0][0]
+                    similarities.append({
+                        'chunk_key': emb_doc['chunk_key'],
+                        'similarity': float(similarity),
+                        'text_preview': emb_doc['text_preview'],
+                        'page_number': emb_doc['page_number']
+                    })
+                except Exception as e:
+                    print(f"Similarity calculation error: {str(e)}")
+                    continue
+            
+            # Sort by similarity and return top_k
+            similarities.sort(key=lambda x: x['similarity'], reverse=True)
+            return similarities[:top_k]
+            
+        except Exception as e:
+            print(f"Vector search error: {str(e)}")
+            return []
+    
+    def graph_expansion(self, chunk_keys: List[str], max_hops: int = 2) -> Dict[str, Any]:
+        """Expand from chunks to related entities and their neighbors"""
+        try:
+            if not chunk_keys:
+                return {'entities': [], 'relationships': [], 'chunks': []}
+            
+            # Get full chunk information
+            chunks_cursor = self.db.aql.execute(
+                "FOR chunk IN document_chunks FILTER chunk._key IN @keys RETURN chunk",
+                bind_vars={'keys': chunk_keys}
+            )
+            chunks = list(chunks_cursor)
+            
+            # Find entities mentioned in these chunks
+            entities_cursor = self.db.aql.execute(
+                """
+                FOR entity IN entities
+                    FILTER LENGTH(
+                        FOR chunk_key IN @chunk_keys
+                            FILTER chunk_key IN entity.source_chunks
+                            RETURN true
+                    ) > 0
+                    RETURN entity
+                """,
+                bind_vars={'chunk_keys': chunk_keys}
+            )
+            direct_entities = list(entities_cursor)
+            
+            if not direct_entities:
+                return {'entities': direct_entities, 'relationships': [], 'chunks': chunks}
+            
+            # Get entity keys for graph traversal
+            entity_keys = [e['_key'] for e in direct_entities]
+            
+            # Expand to neighboring entities (multi-hop)
+            expanded_entities = direct_entities.copy()
+            current_keys = entity_keys.copy()
+            
+            for hop in range(max_hops):
+                if not current_keys:
+                    break
+                    
+                # Find neighbors
+                neighbors_cursor = self.db.aql.execute(
+                    """
+                    FOR entity IN entities
+                        FILTER entity._key IN (
+                            FOR rel IN relationships
+                                FILTER SPLIT(rel._from, '/')[1] IN @keys OR SPLIT(rel._to, '/')[1] IN @keys
+                                RETURN SPLIT(rel._from, '/')[1] == entity._key ? SPLIT(rel._to, '/')[1] : SPLIT(rel._from, '/')[1]
+                        )
+                        FILTER entity._key NOT IN @existing_keys
+                        LIMIT 20
+                        RETURN entity
+                    """,
+                    bind_vars={'keys': current_keys, 'existing_keys': [e['_key'] for e in expanded_entities]}
+                )
+                
+                new_neighbors = list(neighbors_cursor)
+                if not new_neighbors:
+                    break
+                    
+                expanded_entities.extend(new_neighbors)
+                current_keys = [e['_key'] for e in new_neighbors]
+            
+            # Get relationships between all entities
+            all_entity_keys = [e['_key'] for e in expanded_entities]
+            relationships_cursor = self.db.aql.execute(
+                """
+                FOR rel IN relationships
+                    FILTER SPLIT(rel._from, '/')[1] IN @keys AND SPLIT(rel._to, '/')[1] IN @keys
+                    RETURN rel
+                """,
+                bind_vars={'keys': all_entity_keys}
+            )
+            
+            relationships_list = list(relationships_cursor)
+            
+            return {
+                'entities': expanded_entities,
+                'relationships': relationships_list,
+                'chunks': chunks
+            }
+            
+        except Exception as e:
+            print(f"Graph expansion error: {str(e)}")
+            return {'entities': [], 'relationships': [], 'chunks': []}
+    
+    def hybrid_query(self, question: str, vector_top_k: int = 5, max_graph_hops: int = 2) -> Tuple[str, Optional[str]]:
+        """Main hybrid RAG query method"""
+        try:
+            if not question.strip():
+                return "Please enter a valid question.", None
+            
+            print(f"\n🔍 Hybrid RAG Processing: '{question}'")
+            
+            # Step 1: Vector search for semantic similarity
+            print("Step 1: Vector search...")
+            vector_results = self.vector_search(question, vector_top_k)
+            
+            if not vector_results:
+                return "No semantically similar content found. The knowledge base might not contain information about this topic.", None
+            
+            # Step 2: Graph expansion from vector results
+            print("Step 2: Graph expansion...")
+            chunk_keys = [r['chunk_key'] for r in vector_results]
+            graph_data = self.graph_expansion(chunk_keys, max_graph_hops)
+            
+            # Step 3: Build comprehensive context
+            print("Step 3: Building context...")
+            context = self._build_hybrid_context(vector_results, graph_data)
+            
+            # Step 4: Generate answer using LLM
+            print("Step 4: Generating answer...")
+            answer = self._generate_answer(question, context)
+            
+            # Step 5: Create visualization
+            print("Step 5: Creating visualization...")
+            viz_path = self._create_hybrid_visualization(vector_results, graph_data)
+            
+            return answer, viz_path
+            
+        except Exception as e:
+            return f"Error processing hybrid query: {str(e)}", None
+    
+    def _build_hybrid_context(self, vector_results: List[Dict], graph_data: Dict) -> str:
+        """Build rich context from vector and graph data"""
+        context = "HYBRID KNOWLEDGE CONTEXT:\n\n"
+        
+        # Add vector search results (most relevant chunks)
+        context += "=== SEMANTICALLY RELEVANT CONTENT ===\n"
+        for i, result in enumerate(vector_results, 1):
+            chunk_key = result['chunk_key']
+            similarity = result['similarity']
+            
+            # Get full chunk text
+            try:
+                chunk_doc = document_chunks.get(chunk_key)
+                context += f"{i}. [Page {result['page_number']}, Similarity: {similarity:.3f}]\n"
+                context += f"{chunk_doc['text'][:800]}...\n\n"
+            except:
+                context += f"{i}. [Page {result['page_number']}] {result['text_preview']}...\n\n"
+        
+        # Add graph entities and relationships
+        context += "=== RELATED TECHNICAL COMPONENTS ===\n"
+        entities = graph_data.get('entities', [])
+        relationships = graph_data.get('relationships', [])
+        
+        if entities:
+            context += "Components mentioned:\n"
+            for entity in entities[:15]:  # Limit to most relevant
+                props_str = ""
+                if entity.get('properties'):
+                    props_str = f" - {entity['properties'].get('description', '')}"
+                context += f"• {entity['name']} ({entity.get('type', 'component')}){props_str}\n"
+        
+        if relationships:
+            context += "\nComponent Relationships:\n"
+            for rel in relationships[:10]:  # Limit relationships
+                try:
+                    source = rel['_from'].split('/')[1]
+                    target = rel['_to'].split('/')[1]
+                    rel_type = rel.get('type', 'related')
+                    description = rel.get('description', '')
+                    context += f"• {source} → {target} ({rel_type})"
+                    if description:
+                        context += f": {description}"
+                    context += "\n"
+                except:
+                    continue
+        
+        return context
+    
+    def _generate_answer(self, question: str, context: str) -> str:
+        """Generate answer using LLM with hybrid context"""
+        prompt = f"""
+        You are a technical knowledge assistant with access to both semantic content and structural relationships.
+        
+        HYBRID CONTEXT:
+        {context}
+        
+        USER QUESTION: {question}
+        
+        Instructions:
+        - Provide a comprehensive answer using BOTH the semantic content and structural relationships
+        - Explain technical concepts clearly and precisely
+        - Reference specific components and their relationships when relevant
+        - If information spans multiple sections, synthesize it coherently
+        - Be specific about technical details, parameters, and specifications
+        - If information is incomplete, indicate what aspects are covered
+        - Format technical information clearly with bullet points when appropriate
+        """
+        
+        try:
+            response = requests.post(
+                "http://localhost:11434/api/generate",
+                json={
+                    "model": "llama3.2:1b",
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"temperature": 0.2, "num_ctx": 4096}
+                },
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                return response.json().get('response', 'Error processing response').strip()
+            else:
+                return "Error generating response from LLM API"
+                
+        except requests.exceptions.Timeout:
+            return "Response timeout - providing raw context for reference."
+        except Exception as e:
+            return f"LLM Error: {str(e)}"
+    
+    def _create_hybrid_visualization(self, vector_results: List[Dict], graph_data: Dict) -> Optional[str]:
+        """Create enhanced visualization showing both vector and graph results"""
+        try:
+            net = Network(
+                notebook=True,
+                height="800px", 
+                width="100%",
+                cdn_resources='remote',
+                bgcolor="#1a1a1a",
+                font_color="white"
+            )
+            
+            # Add chunk nodes (vector results)
+            chunk_nodes = set()
+            for i, result in enumerate(vector_results):
+                chunk_key = result['chunk_key']
+                chunk_nodes.add(chunk_key)
+                
+                net.add_node(
+                    chunk_key,
+                    label=f"Chunk P{result['page_number']}",
+                    title=f"Similarity: {result['similarity']:.3f}\n{result['text_preview']}",
+                    color="#ff6b6b",  # Red for vector results
+                    size=30,
+                    shape="box"
+                )
+            
+            # Add entity nodes
+            entity_keys = set()
+            for entity in graph_data.get('entities', []):
+                entity_key = entity['_key']
+                entity_keys.add(entity_key)
+                
+                # Different colors based on relationship to chunks
+                source_chunks = entity.get('source_chunks', [])
+                is_from_vector_chunks = any(chunk in chunk_nodes for chunk in source_chunks)
+                
+                color = "#4CAF50" if is_from_vector_chunks else "#64B5F6"  # Green for direct, blue for expanded
+                size = 25 if is_from_vector_chunks else 20
+                
+                # Create tooltip
+                props_str = ""
+                for k, v in entity.get('properties', {}).items():
+                    props_str += f"{k}: {v}\n"
+                
+                tooltip = f"Type: {entity.get('type', 'Unknown')}\nSource Chunks: {len(source_chunks)}\n{props_str}"
+                
+                net.add_node(
+                    entity_key,
+                    label=entity['name'][:15] + ("..." if len(entity['name']) > 15 else ""),
+                    title=tooltip,
+                    color=color,
+                    size=size,
+                    shape="ellipse"
+                )
+            
+            # Add relationships between entities
+            for rel in graph_data.get('relationships', []):
+                try:
+                    source = rel['_from'].split('/')[1]
+                    target = rel['_to'].split('/')[1]
+                    
+                    # Only show relationships between entities we're displaying
+                    if source in entity_keys and target in entity_keys:
+                        net.add_edge(
+                            source,
+                            target,
+                            title=rel.get('type', 'related'),
+                            color="#888888",
+                            label=rel.get('type', '')[:10],
+                            font={"size": 8}
+                        )
+                except:
+                    continue
+            
+            # Add connections between chunks and entities
+            for entity in graph_data.get('entities', []):
+                entity_key = entity['_key']
+                for chunk_key in entity.get('source_chunks', []):
+                    if chunk_key in chunk_nodes:
+                        net.add_edge(
+                            chunk_key,
+                            entity_key,
+                            color="#FFA500",  # Orange for chunk-entity connections
+                            dashes=True,
+                            width=2
+                        )
+            
+            # Configure physics for better layout
+            net.set_options("""
+            var options = {
+                "physics": {
+                    "enabled": true,
+                    "stabilization": {
+                        "enabled": true,
+                        "iterations": 100,
+                        "updateInterval": 25
+                    },
+                    "forceAtlas2Based": {
+                        "gravitationalConstant": -50,
+                        "centralGravity": 0.01,
+                        "springLength": 100,
+                        "springConstant": 0.08,
+                        "damping": 0.4
+                    },
+                    "hierarchicalRepulsion": {
+                        "nodeDistance": 120
+                    }
+                },
+                "nodes": {
+                    "borderWidth": 2,
+                    "borderWidthSelected": 4
+                }
+            }
+            """)
+            
+            net.show(self.visualization_file)
+            return os.path.abspath(self.visualization_file)
+            
+        except Exception as e:
+            print(f"Visualization error: {str(e)}")
+            return None
+
+    def interactive_query_loop(self):
+        """Run interactive query interface"""
+        print("\n" + "="*60)
+        print("🤖 HYBRID RAG SYSTEM READY")
+        print("Combining vector search with knowledge graph reasoning")
+        print("Type 'stats' for system info, 'exit' to quit")
+        print("="*60)
+        
+        while True:
+            try:
+                question = input("\n🔍 Your question: ").strip()
+                
+                if question.lower() in ['exit', 'quit', 'q']:
+                    break
+                elif question.lower() == 'stats':
+                    stats = self.get_stats()
+                    print("\n📊 Hybrid RAG Statistics:")
+                    print(f"• Entities: {stats['entities']}")
+                    print(f"• Relationships: {stats['relationships']}")
+                    print(f"• Document Chunks: {stats['chunks']}")
+                    print(f"• Vector Embeddings: {stats['embeddings']}")
+                    continue
+                elif not question:
+                    continue
+                
+                print("\nProcessing with hybrid approach...")
+                start_time = time.time()
+                answer, viz_path = self.hybrid_query(question)
+                elapsed = time.time() - start_time
+                
+                print(f"\n💡 Answer (generated in {elapsed:.2f}s):")
+                print(answer)
+                
+                if viz_path:
+                    try:
+                        webbrowser.open(f'file://{viz_path}')
+                        print("\n🎨 Visualization opened in browser")
+                    except:
+                        print(f"\n📄 Visualization saved to: {viz_path}")
+                
+            except KeyboardInterrupt:
+                print("\nExiting...")
+                break
+            except Exception as e:
+                print(f"Error: {str(e)}")
+
+# === MAIN EXECUTION ===
+if __name__ == "__main__":
+    print("=== HYBRID RAG SYSTEM: VECTOR + GRAPH ===")
+    
+    # Process PDF and build hybrid knowledge base
+    pdf_path = r"C:\Users\STW\Downloads\MA_DWM1000_2000_en_120509.pdf"
+    
+    if not os.path.exists(pdf_path):
+        print(f"ERROR: PDF file not found at {pdf_path}")
+        print("Please update the pdf_path variable with the correct file location.")
+        exit(1)
+    
+    print("Building hybrid knowledge base...")
+    extraction_results = extract_and_structure_pdf_hybrid(pdf_path)
+    
+    if extraction_results['chunks'] > 0:
+        # Initialize hybrid RAG system
+        hybrid_rag = HybridRAG(db)
+        
+        # Show statistics
+        stats = hybrid_rag.get_stats()
+        print("\n📊 Knowledge Base Statistics:")
+        print(f"• Entities: {stats['entities']}")
+        print(f"• Relationships: {stats['relationships']}")
+        print(f"• Document Chunks: {stats['chunks']}")
+        print(f"• Vector Embeddings: {stats['embeddings']}")
+        
+        # Generate initial visualization
+        print("\n🎨 Generating initial hybrid visualization...")
+        initial_viz = hybrid_rag._create_hybrid_visualization(
+            [{'chunk_key': 'sample', 'page_number': 1, 'similarity': 1.0, 'text_preview': 'Initial view'}],
+            {'entities': [], 'relationships': []}
+        )
+        if initial_viz:
+            try:
+                webbrowser.open(f'file://{initial_viz}')
+                print("✅ Visualization opened in browser")
+            except:
+                print(f"📄 Visualization saved to: {initial_viz}")
+        
+        # Start interactive query interface
+        hybrid_rag.interactive_query_loop()
+        
+        print("\n✅ Session completed!")
+        print(f"📄 Final visualization: {hybrid_rag.visualization_file}")
+        
+    else:
+        print("❌ Failed to extract information from PDF.")
+        print("Please check:")
+        print("1. File path is correct")
+        print("2. PDF contains readable text")
+        print("3. Voyage AI API key is valid")
+        print("4. Qwen API is running on localhost:11434")
+        print("5. PDF is not corrupted or password protected")
