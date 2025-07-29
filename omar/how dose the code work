@@ -1,0 +1,109 @@
+Let me explain how the search and knowledge graph storage works in this GraphRAG system, and how it generates answers:
+
+### How Search Happens:
+
+1. **Query Processing**:
+   - When you ask a question, the system first processes it to extract entities/concepts
+   - It stores these extracted concepts in Neo4j knowledge graph
+   - Example: If you ask "What is DWM1000's operating voltage?", it extracts "DWM1000" as an entity and "operating voltage" as a concept
+
+2. **Hybrid Search**:
+   - The system performs three parallel searches:
+     a) **Semantic Search** (FAISS): Finds document chunks similar to your question
+     b) **Knowledge Graph Search**: Finds related concepts in Neo4j
+     c) **Conversation History Search**: Finds similar past questions
+
+3. **Context Enhancement**:
+   - Combines results from all searches
+   - Enhances your original question with relevant concepts from the knowledge graph
+   - Example: Original question gets augmented with related terms found in the graph
+
+### How Knowledge Graph is Stored:
+
+1. **Entity Extraction**:
+   ```python
+   def extract_entities_and_concepts(self, text: str) -> Dict:
+       # Uses LLM to extract structured knowledge
+       prompt = f"Extract key concepts from: {text[:2000]}..."
+       response = self.llm.simple_generate(prompt)
+       return parsed_json_response
+   ```
+
+2. **Graph Storage**:
+   ```python
+   def store_knowledge_graph(self, knowledge: Dict, source_text: str):
+       # Stores extracted knowledge in Neo4j
+       for concept in knowledge["concepts"]:
+           session.run("""
+           MERGE (c:Concept {name: $name})
+           SET c.description = $description,
+               c.importance = $importance
+           """, concept)
+   ```
+
+3. **Relationship Building**:
+   - Creates connections between concepts
+   - Tracks how often concepts are mentioned
+   - Example: "DWM1000" node gets connected to "voltage" node with "HAS_VOLTAGE" relationship
+
+### Answer Generation Process:
+
+1. **Context Assembly**:
+   ```python
+   def query_llm_with_context(self, query: str, context: Dict):
+       # Combines document context + graph context + conversation history
+       system_prompt = f"""
+       Document Context: {context['faiss_results'][:3]}
+       Knowledge Graph: {context['graph_context']['concepts'][:3]}
+       """
+       messages = [{"role": "system", "content": system_prompt}]
+       return self.llm.chat_generate(messages)
+   ```
+
+2. **Correction Handling**:
+   - If you correct the system, it:
+     a) Stores the correction in conversation history
+     b) Updates relevant knowledge graph nodes
+     c) Adjusts relationship weights
+   - Example code for handling corrections:
+   ```python
+   def handle_correction(self, correction: str):
+       # Extract corrected information
+       knowledge = self.extract_entities_and_concepts(correction)
+       
+       # Update graph with corrected info
+       with self.neo4j_driver.session() as session:
+           session.run("""
+           MATCH (c:Concept {name: $name})
+           SET c.description = $corrected_description,
+               c.last_corrected = datetime()
+           """, knowledge["concepts"][0])
+   ```
+
+3. **Confidence-Based Response**:
+   - The system checks similarity scores from searches
+   - High confidence = direct answer with sources
+   - Low confidence = "I'm not certain, but..." type response
+
+### Key Components Working Together:
+
+1. **FAISS Vector Store** - Handles document similarity search
+2. **Neo4j Graph** - Manages conceptual relationships
+3. **Ollama LLM** - Generates final answers using all contexts
+4. **Conversation Memory** - Maintains dialog context
+
+### Example Flow:
+
+1. You ask: "What's the range of DWM1000?"
+2. System:
+   - Extracts ["DWM1000", "range"] as key concepts
+   - Finds similar document chunks about DWM1000 specs
+   - Locates "range" related nodes in knowledge graph
+   - Combines this into a prompt for the LLM
+3. LLM generates answer based on all contexts
+4. If you say "Actually, the max range is 200m", it:
+   - Updates "range" property of DWM1000 node
+   - Adjusts relationship weights
+   - Stores correction in conversation history
+
+The system doesn't just repeat text - it builds a structured understanding of your documents and questions through the knowledge graph, then synthesizes answers using all available information.
