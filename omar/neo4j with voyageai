@@ -1,0 +1,763 @@
+import voyageai
+import faiss
+import numpy as np
+import fitz  # PyMuPDF
+from PIL import Image
+import io
+import requests
+from neo4j import GraphDatabase
+from typing import List, Dict, Union, Optional, Tuple
+import os
+import json
+import re
+from datetime import datetime, timedelta
+import logging
+
+# Configuration
+VOYAGE_API_KEY = "pa-tDh9PAJmIfaPahq1-GkuSk8uVNGrI69sq3uxpiGK8Y7"
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "llama3.2:1b"
+PDF_PATH = r"C:\Users\STW\Downloads\MA_DWM1000_2000_en_120509.pdf"
+CONTEXT_FILE = "search_context.json"
+
+# Neo4j Connection
+NEO4J_URI = "bolt://localhost:7687"
+NEO4J_AUTH = ("neo4j", "omarnasser")
+
+# Initialize Voyage AI client
+voyageai.api_key = VOYAGE_API_KEY
+client = voyageai.Client()
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class GraphRAGSystem:
+    def __init__(self):
+        self.faiss_index = None
+        self.metadata = []
+        self.neo4j_driver = None
+        self.vector_index_created = False
+        self.knowledge_graph_created = False
+        self.conversation_history = []
+        self.current_session_id = None
+        self.load_context()
+        
+    def load_context(self):
+        """Load previous context from file if exists"""
+        try:
+            if os.path.exists(CONTEXT_FILE):
+                with open(CONTEXT_FILE, 'r') as f:
+                    data = json.load(f)
+                    self.conversation_history = data.get('conversation_history', [])
+                    self.current_session_id = data.get('current_session_id', self.generate_session_id())
+                    logger.info("✅ Loaded previous conversation context")
+            else:
+                self.current_session_id = self.generate_session_id()
+        except Exception as e:
+            logger.error(f"⚠️ Failed to load context: {str(e)}")
+            self.current_session_id = self.generate_session_id()
+    
+    def generate_session_id(self):
+        """Generate unique session ID"""
+        return f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    def save_context(self):
+        """Save current context to file"""
+        try:
+            with open(CONTEXT_FILE, 'w') as f:
+                json.dump({
+                    'conversation_history': self.conversation_history,
+                    'current_session_id': self.current_session_id,
+                    'last_updated': datetime.now().isoformat()
+                }, f, indent=2)
+        except Exception as e:
+            logger.error(f"⚠️ Failed to save context: {str(e)}")
+    
+    def connect_neo4j(self):
+        """Connect to Neo4j database and setup GraphRAG schema"""
+        try:
+            self.neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
+            
+            # Verify connection
+            with self.neo4j_driver.session() as session:
+                result = session.run("RETURN 1 AS test")
+                if result.single()["test"] == 1:
+                    logger.info("✅ Successfully connected to Neo4j")
+                    
+            # Create vector index and knowledge graph schema
+            self.create_neo4j_vector_index()
+            self.create_knowledge_graph_schema()
+            
+        except Exception as e:
+            logger.error(f"⚠️ Neo4j connection failed: {str(e)}")
+            self.neo4j_driver = None
+
+    def create_neo4j_vector_index(self):
+        """Create vector index in Neo4j"""
+        if not self.neo4j_driver:
+            return
+            
+        try:
+            with self.neo4j_driver.session() as session:
+                # Check if vector index exists
+                index_exists = session.run(
+                    "SHOW INDEXES WHERE type = 'VECTOR' AND name = 'document_embeddings'"
+                ).single()
+                
+                if not index_exists:
+                    session.run("""
+                    CREATE VECTOR INDEX document_embeddings 
+                    FOR (d:Document) ON (d.embedding)
+                    OPTIONS {
+                        indexConfig: {
+                            `vector.dimensions`: 1024,
+                            `vector.similarity_function`: 'cosine'
+                        }
+                    }
+                    """)
+                    logger.info("✅ Created vector index in Neo4j")
+                    
+                self.vector_index_created = True
+                    
+        except Exception as e:
+            logger.error(f"⚠️ Failed to create vector index: {str(e)}")
+            self.vector_index_created = False
+
+    def create_knowledge_graph_schema(self):
+        """Create GraphRAG knowledge graph schema"""
+        if not self.neo4j_driver:
+            return
+            
+        try:
+            with self.neo4j_driver.session() as session:
+                # Create constraints and indexes for GraphRAG
+                session.run("""
+                CREATE CONSTRAINT unique_concept IF NOT EXISTS 
+                FOR (c:Concept) REQUIRE c.name IS UNIQUE
+                """)
+                
+                session.run("""
+                CREATE CONSTRAINT unique_entity IF NOT EXISTS 
+                FOR (e:Entity) REQUIRE e.name IS UNIQUE
+                """)
+                
+                session.run("""
+                CREATE CONSTRAINT unique_session IF NOT EXISTS 
+                FOR (s:Session) REQUIRE s.id IS UNIQUE
+                """)
+                
+                session.run("""
+                CREATE CONSTRAINT unique_query IF NOT EXISTS 
+                FOR (q:Query) REQUIRE q.id IS UNIQUE
+                """)
+                
+                # Create fulltext search index
+                try:
+                    session.run("""
+                    CREATE FULLTEXT INDEX conceptSearch IF NOT EXISTS 
+                    FOR (n:Concept|Entity) ON EACH [n.name, n.description]
+                    """)
+                except:
+                    pass  # Index might already exist
+                
+                # Create vector index for concept embeddings
+                try:
+                    session.run("""
+                    CREATE VECTOR INDEX concept_embeddings IF NOT EXISTS
+                    FOR (c:Concept) ON (c.embedding)
+                    OPTIONS {
+                        indexConfig: {
+                            `vector.dimensions`: 1024,
+                            `vector.similarity_function`: 'cosine'
+                        }
+                    }
+                    """)
+                except:
+                    pass  # Index might already exist
+                
+                logger.info("✅ Created GraphRAG knowledge graph schema")
+                self.knowledge_graph_created = True
+                
+        except Exception as e:
+            logger.error(f"⚠️ Failed to create knowledge graph schema: {str(e)}")
+            self.knowledge_graph_created = False
+
+    def extract_entities_and_concepts(self, text: str) -> Dict:
+        """Extract entities and concepts using LLM"""
+        prompt = f"""
+        Extract key concepts, entities, and their relationships from this text. 
+        Focus on technical terms, specifications, product names, and important concepts.
+        
+        Text: {text[:2000]}...
+        
+        Return ONLY a valid JSON object with this exact structure:
+        {{
+            "concepts": [
+                {{"name": "concept_name", "description": "brief description", "importance": 0.8, "type": "technical|general"}}
+            ],
+            "entities": [
+                {{"name": "entity_name", "description": "brief description", "type": "product|specification|measurement"}}
+            ],
+            "relationships": [
+                {{"source": "source_name", "target": "target_name", "type": "relates_to|part_of|specifies", "strength": 0.7}}
+            ]
+        }}
+        """
+        
+        try:
+            response = self.query_llm_simple(prompt)
+            # Clean the response to extract JSON
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                json_str = json_match.group()
+                return json.loads(json_str)
+            else:
+                logger.warning("No valid JSON found in LLM response")
+                return {"concepts": [], "entities": [], "relationships": []}
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error: {str(e)}")
+            return {"concepts": [], "entities": [], "relationships": []}
+        except Exception as e:
+            logger.error(f"Failed to extract entities: {str(e)}")
+            return {"concepts": [], "entities": [], "relationships": []}
+
+    def store_knowledge_graph(self, knowledge: Dict, source_text: str):
+        """Store extracted knowledge in Neo4j graph"""
+        if not self.neo4j_driver or not self.knowledge_graph_created:
+            return
+            
+        try:
+            with self.neo4j_driver.session() as session:
+                # Store concepts with embeddings
+                for concept in knowledge.get('concepts', []):
+                    # Generate embedding for concept
+                    concept_embedding = client.multimodal_embed(
+                        inputs=[[concept['name'] + " " + concept.get('description', '')]],
+                        model="voyage-multimodal-3",
+                        input_type="document"
+                    ).embeddings[0]
+                    
+                    session.run("""
+                    MERGE (c:Concept {name: $name})
+                    SET c.description = $description,
+                        c.importance = $importance,
+                        c.type = $type,
+                        c.embedding = $embedding,
+                        c.last_mentioned = datetime(),
+                        c.mention_count = coalesce(c.mention_count, 0) + 1
+                    """, {
+                        **concept,
+                        'embedding': concept_embedding
+                    })
+                
+                # Store entities
+                for entity in knowledge.get('entities', []):
+                    session.run("""
+                    MERGE (e:Entity {name: $name})
+                    SET e.description = $description,
+                        e.type = $type,
+                        e.last_mentioned = datetime(),
+                        e.mention_count = coalesce(e.mention_count, 0) + 1
+                    """, entity)
+                
+                # Store relationships
+                for rel in knowledge.get('relationships', []):
+                    session.run("""
+                    MATCH (source) WHERE source.name = $source
+                    MATCH (target) WHERE target.name = $target
+                    MERGE (source)-[r:RELATES {type: $type}]->(target)
+                    SET r.strength = $strength,
+                        r.last_used = datetime(),
+                        r.usage_count = coalesce(r.usage_count, 0) + 1
+                    """, rel)
+                
+                # Create session and link to current conversation
+                session.run("""
+                MERGE (s:Session {id: $session_id})
+                SET s.last_active = datetime()
+                """, {"session_id": self.current_session_id})
+                
+                logger.info(f"✅ Stored knowledge graph: {len(knowledge.get('concepts', []))} concepts, {len(knowledge.get('entities', []))} entities")
+                
+        except Exception as e:
+            logger.error(f"⚠️ Failed to store knowledge graph: {str(e)}")
+
+    def get_graph_context(self, query: str, top_k: int = 5) -> List[Dict]:
+        """Retrieve relevant context from knowledge graph"""
+        if not self.neo4j_driver or not self.knowledge_graph_created:
+            return []
+            
+        try:
+            # Generate query embedding
+            query_embedding = client.multimodal_embed(
+                inputs=[[query]],
+                model="voyage-multimodal-3",
+                input_type="document"
+            ).embeddings[0]
+            
+            with self.neo4j_driver.session() as session:
+                # Vector similarity search on concepts
+                vector_results = session.run("""
+                CALL db.index.vector.queryNodes('concept_embeddings', $top_k, $embedding)
+                YIELD node, score
+                MATCH (node)-[r:RELATES]-(related)
+                RETURN node.name as concept, 
+                       node.description as description,
+                       score,
+                       collect(DISTINCT {name: related.name, type: labels(related)[0], relationship: r.type}) as related_items
+                ORDER BY score DESC
+                """, {"top_k": top_k, "embedding": query_embedding}).data()
+                
+                # Also try fulltext search as fallback
+                fulltext_results = []
+                try:
+                    fulltext_results = session.run("""
+                    CALL db.index.fulltext.queryNodes('conceptSearch', $query)
+                    YIELD node, score
+                    WHERE score > 0.5
+                    MATCH (node)-[r:RELATES]-(related)
+                    RETURN node.name as concept, 
+                           node.description as description,
+                           score,
+                           collect(DISTINCT {name: related.name, type: labels(related)[0], relationship: r.type}) as related_items
+                    ORDER BY score DESC
+                    LIMIT $top_k
+                    """, {"query": query, "top_k": top_k}).data()
+                except:
+                    pass  # Fulltext index might not be ready
+                
+                # Combine and deduplicate results
+                all_results = vector_results + fulltext_results
+                seen_concepts = set()
+                unique_results = []
+                
+                for result in all_results:
+                    if result['concept'] not in seen_concepts:
+                        seen_concepts.add(result['concept'])
+                        unique_results.append(result)
+                
+                return unique_results[:top_k]
+                
+        except Exception as e:
+            logger.error(f"⚠️ Failed to get graph context: {str(e)}")
+            return []
+
+    def process_pdf(self, pdf_path: str) -> List[Union[str, Image.Image]]:
+        """Extract text and images from PDF"""
+        doc = fitz.open(pdf_path)
+        pdf_text = ""
+        pdf_images = []
+
+        for page in doc:
+            # Extract text
+            pdf_text += page.get_text()
+            
+            # Extract images
+            image_list = page.get_images(full=True)
+            for img in image_list:
+                try:
+                    xref = img[0]
+                    base_image = doc.extract_image(xref)
+                    image_bytes = base_image["image"]
+                    pdf_images.append(Image.open(io.BytesIO(image_bytes)).resize((256, 256)))
+                except:
+                    continue
+        
+        doc.close()
+        return [pdf_text, *pdf_images] if pdf_images else [pdf_text]
+
+    def chunk_document(self, text: str, chunk_size: int = 1000) -> List[str]:
+        """Split document into manageable chunks"""
+        words = text.split()
+        chunks = [' '.join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
+        return chunks
+
+    def create_faiss_index(self, documents: List[List[Union[str, Image.Image]]]):
+        """Create FAISS index and extract knowledge from documents"""
+        # Process documents into chunks
+        processed_docs = []
+        all_text = ""
+        
+        for doc in documents:
+            text = doc[0]
+            images = doc[1:] if len(doc) > 1 else []
+            all_text += text + " "
+            
+            # Split text into chunks
+            chunks = self.chunk_document(text)
+            for chunk in chunks:
+                processed_docs.append([chunk, *images])
+        
+        logger.info(f"🔄 Processing {len(processed_docs)} document chunks...")
+        
+        # Extract and store knowledge from the entire document
+        logger.info("🧠 Extracting knowledge graph from document...")
+        knowledge = self.extract_entities_and_concepts(all_text)
+        self.store_knowledge_graph(knowledge, all_text)
+        
+        # Get embeddings for all chunks
+        response = client.multimodal_embed(
+            inputs=processed_docs,
+            model="voyage-multimodal-3",
+            input_type="document"
+        )
+        
+        embeddings = np.array(response.embeddings).astype("float32")
+        dimension = embeddings.shape[1]
+        
+        # Create and populate FAISS index
+        self.faiss_index = faiss.IndexFlatL2(dimension)
+        self.faiss_index.add(embeddings)
+        self.metadata = [doc[0] for doc in processed_docs]
+        
+        logger.info(f"✅ Created FAISS index with {len(embeddings)} vectors")
+        return response, processed_docs
+
+    def store_in_neo4j(self, documents: List[List[Union[str, Image.Image]]], embeddings: List[List[float]]):
+        """Store documents and embeddings in Neo4j"""
+        if not self.neo4j_driver or not self.vector_index_created:
+            logger.warning("⚠️ Neo4j not properly configured - skipping document storage")
+            return
+            
+        try:
+            with self.neo4j_driver.session() as session:
+                for i, (doc, embedding) in enumerate(zip(documents, embeddings)):
+                    session.run(
+                        """
+                        MERGE (d:Document {id: $id})
+                        SET d.text = $text,
+                            d.embedding = $embedding,
+                            d.has_image = $has_image,
+                            d.source = $source,
+                            d.chunk_index = $chunk_index,
+                            d.timestamp = datetime()
+                        """,
+                        {
+                            "id": f"doc_{i}",
+                            "text": doc[0],
+                            "embedding": embedding,
+                            "has_image": len(doc) > 1,
+                            "source": PDF_PATH,
+                            "chunk_index": i
+                        }
+                    )
+            logger.info(f"💾 Stored {len(documents)} document chunks in Neo4j")
+        except Exception as e:
+            logger.error(f"⚠️ Failed to store documents in Neo4j: {str(e)}")
+
+    def graphrag_search(self, query: str, top_k: int = 3) -> Dict:
+        """Enhanced search using GraphRAG approach"""
+        # Store query in conversation history
+        self.conversation_history.append({
+            "role": "user",
+            "content": query,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        # Extract knowledge from query and store in graph
+        query_knowledge = self.extract_entities_and_concepts(query)
+        self.store_knowledge_graph(query_knowledge, query)
+        
+        # Get graph context
+        graph_context = self.get_graph_context(query, top_k)
+        
+        # Enhance query with graph context
+        context_terms = []
+        for context in graph_context:
+            context_terms.append(context['concept'])
+            for item in context.get('related_items', []):
+                context_terms.append(item['name'])
+        
+        enhanced_query = f"{query} {' '.join(context_terms[:10])}"  # Limit context terms
+        
+        # Embed the enhanced query
+        question_embedding = client.multimodal_embed(
+            inputs=[[enhanced_query]],
+            model="voyage-multimodal-3",
+            input_type="document"
+        ).embeddings[0]
+        
+        # FAISS search with enhanced query
+        faiss_results = []
+        if self.faiss_index:
+            query_embedding = np.array([question_embedding]).astype("float32")
+            distances, indices = self.faiss_index.search(query_embedding, top_k)
+            
+            faiss_results = [
+                {
+                    "text": self.metadata[idx],
+                    "score": float(1 / (1 + distances[0][i])),
+                    "source": "FAISS"
+                }
+                for i, idx in enumerate(indices[0])
+            ]
+        
+        # Neo4j vector search
+        neo4j_results = []
+        if self.neo4j_driver and self.vector_index_created:
+            try:
+                with self.neo4j_driver.session() as session:
+                    result = session.run(
+                        """
+                        CALL db.index.vector.queryNodes('document_embeddings', $top_k, $embedding)
+                        YIELD node, score
+                        RETURN node.text AS text, score, node.source AS source
+                        ORDER BY score DESC
+                        """,
+                        {"top_k": top_k, "embedding": question_embedding}
+                    )
+                    neo4j_results = [{
+                        "text": record["text"],
+                        "score": float(record["score"]),
+                        "source": record["source"]
+                    } for record in result]
+            except Exception as e:
+                logger.error(f"⚠️ Neo4j search failed: {str(e)}")
+        
+        return {
+            "faiss_results": faiss_results,
+            "neo4j_results": neo4j_results,
+            "graph_context": graph_context,
+            "enhanced_query": enhanced_query
+        }
+
+    def query_llm_simple(self, prompt: str) -> str:
+        """Simple LLM query without conversation history"""
+        try:
+            response = requests.post(
+                OLLAMA_URL,
+                json={
+                    "model": OLLAMA_MODEL,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.3,
+                        "top_p": 0.9,
+                        "num_ctx": 2048
+                    }
+                },
+                timeout=30
+            )
+            response.raise_for_status()
+            return response.json().get("response", "No response from LLM")
+        except Exception as e:
+            logger.error(f"⚠️ Simple LLM query failed: {str(e)}")
+            return f"Error: {str(e)}"
+
+    def query_llm(self, prompt: str, context: List[Dict], graph_context: List[Dict] = None) -> str:
+        """Query Ollama LLM with GraphRAG context"""
+        try:
+            # Prepare graph context information
+            graph_info = ""
+            if graph_context:
+                graph_info = "\n### Knowledge Graph Context:\n"
+                for ctx in graph_context[:3]:  # Limit to top 3
+                    graph_info += f"- **{ctx['concept']}**: {ctx.get('description', 'No description')}\n"
+                    if ctx.get('related_items'):
+                        related = [item['name'] for item in ctx['related_items'][:3]]
+                        graph_info += f"  Related: {', '.join(related)}\n"
+            
+            # Prepare messages with conversation history and graph context
+            system_message = f"""You are a helpful technical assistant with access to document content and a knowledge graph. 
+            Use the provided context and graph relationships to give comprehensive, accurate answers.
+            
+            {graph_info}"""
+            
+            messages = [
+                {"role": "system", "content": system_message},
+                *[{"role": msg["role"], "content": msg["content"]} 
+                  for msg in self.conversation_history[-8:]],  # Last 4 exchanges
+                {"role": "user", "content": prompt}
+            ]
+            
+            response = requests.post(
+                OLLAMA_URL,
+                json={
+                    "model": OLLAMA_MODEL,
+                    "messages": messages,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.7,
+                        "top_p": 0.9,
+                        "repeat_penalty": 1.1,
+                        "num_ctx": 4096
+                    }
+                },
+                timeout=60
+            )
+            response.raise_for_status()
+            
+            llm_response = response.json().get("response", "No response from LLM")
+            
+            # Store response in conversation history
+            self.conversation_history.append({
+                "role": "assistant",
+                "content": llm_response,
+                "timestamp": datetime.now().isoformat(),
+                "context": context,
+                "graph_context": graph_context
+            })
+            
+            self.save_context()
+            return llm_response
+            
+        except Exception as e:
+            logger.error(f"⚠️ LLM query failed: {str(e)}")
+            return f"Error generating answer: {str(e)}"
+
+    def interactive_search(self):
+        """Interactive GraphRAG search interface"""
+        print("\n🚀 GraphRAG System - Interactive Mode")
+        print("Commands: 'exit' to quit, 'clear' to reset conversation, 'graph' to show graph stats")
+        print("GraphRAG features: Knowledge graph context, entity extraction, relationship mapping\n")
+        
+        while True:
+            try:
+                query = input("\n❓ Your question: ").strip()
+                
+                if query.lower() == 'exit':
+                    print("👋 Goodbye!")
+                    break
+                    
+                if query.lower() == 'clear':
+                    self.conversation_history = []
+                    self.save_context()
+                    print("🧹 Conversation history cleared")
+                    continue
+                
+                if query.lower() == 'graph':
+                    self.show_graph_stats()
+                    continue
+                
+                # Perform GraphRAG search
+                print("\n🔎 Searching with GraphRAG...")
+                results = self.graphrag_search(query)
+                
+                # Combine results (prefer FAISS results if available)
+                context = results["faiss_results"] or results["neo4j_results"]
+                graph_context = results["graph_context"]
+                
+                if context or graph_context:
+                    # Format context for LLM prompt
+                    context_text = ""
+                    if context:
+                        context_text = "\n\n".join([
+                            f"📄 Document (Relevance: {res['score']:.2f}):\n{res['text']}" 
+                            for res in context[:3]
+                        ])
+                    
+                    graph_text = ""
+                    if graph_context:
+                        graph_text = "\n\n### Related Concepts from Knowledge Graph:\n"
+                        for ctx in graph_context[:3]:
+                            graph_text += f"• **{ctx['concept']}**: {ctx.get('description', '')}\n"
+                    
+                    prompt = f"""Answer the question using the document context and knowledge graph relationships:
+                    
+                    ### Document Context:
+                    {context_text}
+                    
+                    {graph_text}
+                    
+                    ### Question:
+                    {query}
+                    
+                    Provide a detailed technical answer. Reference both document content and related concepts."""
+                    
+                    answer = self.query_llm(prompt, context, graph_context)
+                    
+                    print("\n💡 GraphRAG Answer:")
+                    print(answer.strip())
+                    
+                    # Show sources and graph context
+                    if context:
+                        print("\n📚 Document Sources:")
+                        for i, res in enumerate(context[:3], 1):
+                            print(f"{i}. [Relevance: {res['score']:.2f}] {res.get('source', 'Document')}")
+                    
+                    if graph_context:
+                        print(f"\n🧠 Knowledge Graph Context ({len(graph_context)} concepts):")
+                        for ctx in graph_context[:3]:
+                            print(f"• {ctx['concept']} (similarity: {ctx.get('score', 0):.2f})")
+                    
+                else:
+                    print("⚠️ No relevant context found")
+                    answer = self.query_llm(query, [], [])
+                    print("\n💡 General Answer:")
+                    print(answer.strip())
+                    
+            except KeyboardInterrupt:
+                print("\n👋 Goodbye!")
+                break
+            except Exception as e:
+                logger.error(f"⚠️ An error occurred: {str(e)}")
+                print(f"⚠️ An error occurred: {str(e)}")
+
+    def show_graph_stats(self):
+        """Show knowledge graph statistics"""
+        if not self.neo4j_driver:
+            print("⚠️ Neo4j not connected")
+            return
+            
+        try:
+            with self.neo4j_driver.session() as session:
+                # Get counts
+                concepts = session.run("MATCH (c:Concept) RETURN count(c) as count").single()["count"]
+                entities = session.run("MATCH (e:Entity) RETURN count(e) as count").single()["count"]
+                relationships = session.run("MATCH ()-[r:RELATES]->() RETURN count(r) as count").single()["count"]
+                documents = session.run("MATCH (d:Document) RETURN count(d) as count").single()["count"]
+                
+                print(f"\n📊 Knowledge Graph Statistics:")
+                print(f"• Concepts: {concepts}")
+                print(f"• Entities: {entities}")
+                print(f"• Relationships: {relationships}")
+                print(f"• Documents: {documents}")
+                
+                # Show top concepts
+                top_concepts = session.run("""
+                MATCH (c:Concept)
+                RETURN c.name as name, c.mention_count as mentions
+                ORDER BY c.mention_count DESC
+                LIMIT 5
+                """).data()
+                
+                if top_concepts:
+                    print(f"\n🔝 Top Concepts:")
+                    for concept in top_concepts:
+                        print(f"• {concept['name']} ({concept['mentions']} mentions)")
+                
+        except Exception as e:
+            logger.error(f"⚠️ Failed to get graph stats: {str(e)}")
+
+def main():
+    search_system = GraphRAGSystem()
+    search_system.connect_neo4j()
+    
+    # Process PDF only if not already indexed
+    if not search_system.faiss_index:
+        logger.info("📂 Processing PDF document with GraphRAG...")
+        document = search_system.process_pdf(PDF_PATH)
+        documents = [document]
+        
+        # Create FAISS index and extract knowledge
+        embed_response, processed_docs = search_system.create_faiss_index(documents)
+        
+        # Store documents in Neo4j
+        search_system.store_in_neo4j(processed_docs, embed_response.embeddings)
+    else:
+        logger.info("✅ Using existing document index")
+    
+    # Start interactive GraphRAG session
+    search_system.interactive_search()
+
+if __name__ == "__main__":
+    try:
+        import faiss
+        main()
+    except ImportError:
+        print("Error: FAISS not installed. Install with:")
+        print("conda install -c conda-forge faiss-cpu")
+    except Exception as e:
+        logger.error(f"Fatal error: {str(e)}")
+        print(f"Fatal error: {str(e)}")
