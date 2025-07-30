@@ -1,0 +1,1218 @@
+import streamlit as st
+import psycopg2
+import psycopg2.extras
+import voyageai
+import faiss
+import numpy as np
+import fitz  # PyMuPDF
+from PIL import Image
+import io
+import requests
+from neo4j import GraphDatabase
+from typing import List, Dict, Union, Optional, Tuple
+import os
+import json
+import re
+from datetime import datetime, timedelta
+import logging
+import uuid
+import hashlib
+from collections import defaultdict
+
+# Configuration
+VOYAGE_API_KEY = "pa-tDh9PAJmIfaPahq1-GkuSk8uVNGrI69sq3uxpiGK8Y7"
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
+OLLAMA_MODEL = "llama3.2:1b"
+PDF_PATH = r"C:\Users\STW\Downloads\MA_DWM1000_2000_en_120509.pdf"
+
+# Supabase PostgreSQL Connection
+DB_CONFIG = {
+    "dbname": "postgres",
+    "user": "postgres.jsgdmwbhzvwdhardoimb",
+    "password": "omernasser123",
+    "host": "aws-0-us-west-1.pooler.supabase.com",
+    "port": "6543"
+}
+
+# Neo4j Connection
+NEO4J_URI = "bolt://localhost:7687"
+NEO4J_AUTH = ("neo4j", "omarnasser")
+
+# Initialize Voyage AI client
+voyageai.api_key = VOYAGE_API_KEY
+client = voyageai.Client()
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Streamlit page config
+st.set_page_config(
+    page_title="Advanced GraphRAG Chat System",
+    page_icon="🧠",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+class DatabaseManager:
+    """Enhanced PostgreSQL database operations for advanced chat history and analytics"""
+    
+    def __init__(self):
+        self.connection = None
+        self.connect()
+        self.setup_tables()
+    
+    def connect(self):
+        """Connect to PostgreSQL database"""
+        try:
+            self.connection = psycopg2.connect(**DB_CONFIG)
+            logger.info("✅ Successfully connected to Supabase PostgreSQL!")
+        except Exception as e:
+            logger.error(f"❌ Failed to connect to database: {str(e)}")
+            st.error(f"Database connection failed: {str(e)}")
+            self.connection = None
+    
+    def setup_tables(self):
+        """Create enhanced tables for GraphRAG analytics"""
+        if not self.connection:
+            return
+            
+        try:
+            cursor = self.connection.cursor()
+            
+            # Enhanced chats table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS chats (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    title TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    user_id TEXT DEFAULT 'default_user',
+                    is_active BOOLEAN DEFAULT true,
+                    total_messages INTEGER DEFAULT 0,
+                    avg_response_time FLOAT DEFAULT 0.0,
+                    knowledge_domains JSONB DEFAULT '[]',
+                    complexity_score FLOAT DEFAULT 0.0
+                );
+            """)
+            
+            # Enhanced messages table with GraphRAG analytics
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    chat_id UUID REFERENCES chats(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+                    content TEXT NOT NULL,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    metadata JSONB DEFAULT '{}',
+                    context_used INTEGER DEFAULT 0,
+                    graph_context_used INTEGER DEFAULT 0,
+                    voyage_embedding_used BOOLEAN DEFAULT false,
+                    search_strategy TEXT DEFAULT 'hybrid',
+                    relevance_scores JSONB DEFAULT '{}',
+                    extracted_entities JSONB DEFAULT '[]',
+                    graph_paths JSONB DEFAULT '[]',
+                    response_confidence FLOAT DEFAULT 0.0,
+                    processing_time FLOAT DEFAULT 0.0
+                );
+            """)
+            
+            # Knowledge graph analytics table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS knowledge_analytics (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    session_id TEXT NOT NULL,
+                    query_text TEXT NOT NULL,
+                    extracted_concepts JSONB DEFAULT '[]',
+                    graph_traversal_path JSONB DEFAULT '[]',
+                    semantic_similarity_scores JSONB DEFAULT '{}',
+                    voyage_embedding_vector VECTOR(1024),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            
+            # Performance indexes
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_chats_user_id ON chats(user_id);
+                CREATE INDEX IF NOT EXISTS idx_chats_created_at ON chats(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id);
+                CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp DESC);
+                CREATE INDEX IF NOT EXISTS idx_messages_search_strategy ON messages(search_strategy);
+                CREATE INDEX IF NOT EXISTS idx_knowledge_session ON knowledge_analytics(session_id);
+            """)
+            
+            self.connection.commit()
+            logger.info("🛠️ Enhanced GraphRAG database schema created!")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to setup enhanced tables: {str(e)}")
+            if self.connection:
+                self.connection.rollback()
+    
+    def create_chat(self, title: str, user_id: str = "default_user") -> str:
+        """Create a new chat with enhanced metadata"""
+        if not self.connection:
+            return None
+            
+        try:
+            cursor = self.connection.cursor()
+            chat_id = str(uuid.uuid4())
+            
+            cursor.execute("""
+                INSERT INTO chats (id, title, user_id)
+                VALUES (%s, %s, %s)
+                RETURNING id;
+            """, (chat_id, title, user_id))
+            
+            result = cursor.fetchone()
+            self.connection.commit()
+            
+            logger.info(f"✅ Created new enhanced chat: {title}")
+            return result[0] if result else chat_id
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to create chat: {str(e)}")
+            if self.connection:
+                self.connection.rollback()
+            return None
+    
+    def add_enhanced_message(self, chat_id: str, role: str, content: str, 
+                           search_metadata: Dict = None) -> bool:
+        """Add message with comprehensive GraphRAG metadata"""
+        if not self.connection:
+            return False
+            
+        try:
+            cursor = self.connection.cursor()
+            
+            metadata = search_metadata or {}
+            
+            cursor.execute("""
+                INSERT INTO messages (
+                    chat_id, role, content, context_used, graph_context_used,
+                    voyage_embedding_used, search_strategy, relevance_scores,
+                    extracted_entities, graph_paths, response_confidence,
+                    processing_time, metadata
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+            """, (
+                chat_id, role, content,
+                metadata.get('context_used', 0),
+                metadata.get('graph_context_used', 0),
+                metadata.get('voyage_embedding_used', False),
+                metadata.get('search_strategy', 'hybrid'),
+                json.dumps(metadata.get('relevance_scores', {})),
+                json.dumps(metadata.get('extracted_entities', [])),
+                json.dumps(metadata.get('graph_paths', [])),
+                metadata.get('response_confidence', 0.0),
+                metadata.get('processing_time', 0.0),
+                json.dumps(metadata.get('additional_metadata', {}))
+            ))
+            
+            # Update chat statistics
+            cursor.execute("""
+                UPDATE chats SET 
+                    updated_at = CURRENT_TIMESTAMP,
+                    total_messages = total_messages + 1
+                WHERE id = %s;
+            """, (chat_id,))
+            
+            self.connection.commit()
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to add enhanced message: {str(e)}")
+            if self.connection:
+                self.connection.rollback()
+            return False
+    
+    def get_chats(self, user_id: str = "default_user", limit: int = 50) -> List[Dict]:
+        """Get chats with enhanced analytics"""
+        if not self.connection:
+            return []
+            
+        try:
+            cursor = self.connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            cursor.execute("""
+                SELECT c.*, 
+                       COUNT(m.id) as message_count,
+                       MAX(m.timestamp) as last_message_time,
+                       AVG(m.response_confidence) as avg_confidence,
+                       COUNT(CASE WHEN m.voyage_embedding_used THEN 1 END) as voyage_usage_count
+                FROM chats c
+                LEFT JOIN messages m ON c.id = m.chat_id
+                WHERE c.user_id = %s AND c.is_active = true
+                GROUP BY c.id
+                ORDER BY COALESCE(MAX(m.timestamp), c.created_at) DESC
+                LIMIT %s;
+            """, (user_id, limit))
+            
+            return cursor.fetchall()
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to get enhanced chats: {str(e)}")
+            return []
+    
+    def get_chat_messages(self, chat_id: str) -> List[Dict]:
+        """Get messages with GraphRAG metadata"""
+        if not self.connection:
+            return []
+            
+        try:
+            cursor = self.connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            cursor.execute("""
+                SELECT * FROM messages 
+                WHERE chat_id = %s 
+                ORDER BY timestamp ASC;
+            """, (chat_id,))
+            
+            return cursor.fetchall()
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to get messages: {str(e)}")
+            return []
+    
+    def delete_chat(self, chat_id: str) -> bool:
+        """Soft delete chat"""
+        if not self.connection:
+            return False
+            
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute("UPDATE chats SET is_active = false WHERE id = %s;", (chat_id,))
+            self.connection.commit()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to delete chat: {str(e)}")
+            if self.connection:
+                self.connection.rollback()
+            return False
+    
+    def get_chat_analytics(self, chat_id: str) -> Dict:
+        """Get comprehensive chat analytics"""
+        if not self.connection:
+            return {}
+            
+        try:
+            cursor = self.connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            cursor.execute("""
+                SELECT 
+                    COUNT(*) as total_messages,
+                    AVG(response_confidence) as avg_confidence,
+                    AVG(context_used) as avg_context_usage,
+                    AVG(graph_context_used) as avg_graph_usage,
+                    COUNT(CASE WHEN voyage_embedding_used THEN 1 END) as voyage_usage,
+                    AVG(processing_time) as avg_processing_time,
+                    array_agg(DISTINCT search_strategy) as strategies_used
+                FROM messages 
+                WHERE chat_id = %s AND role = 'assistant';
+            """, (chat_id,))
+            
+            return cursor.fetchone() or {}
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to get chat analytics: {str(e)}")
+            return {}
+    
+    def close(self):
+        """Close database connection"""
+        if self.connection:
+            self.connection.close()
+            logger.info("🔚 Database connection closed.")
+
+class AdvancedOllamaLLM:
+    """Enhanced Ollama LLM with GraphRAG integration"""
+    
+    def __init__(self, base_url: str = OLLAMA_URL, model: str = OLLAMA_MODEL):
+        self.base_url = base_url
+        self.chat_url = OLLAMA_CHAT_URL
+        self.model = model
+        self.check_ollama_connection()
+    
+    def check_ollama_connection(self):
+        """Enhanced connection check with model verification"""
+        try:
+            response = requests.get(f"{self.base_url.replace('/api/generate', '')}/api/tags", timeout=5)
+            if response.status_code == 200:
+                models = response.json().get('models', [])
+                model_names = [model['name'] for model in models]
+                
+                if self.model not in model_names:
+                    logger.warning(f"⚠️ Model '{self.model}' not found. Available: {model_names}")
+                    if model_names:
+                        self.model = model_names[0]
+                        logger.info(f"🔄 Using available model: {self.model}")
+                else:
+                    logger.info(f"✅ Ollama connected with model: {self.model}")
+            else:
+                logger.error("❌ Ollama server not responding")
+        except Exception as e:
+            logger.error(f"❌ Ollama connection failed: {str(e)}")
+    
+    def enhanced_chat_generate(self, messages: List[Dict], graph_context: List[Dict] = None, **kwargs) -> Tuple[str, float]:
+        """Enhanced chat generation with confidence scoring"""
+        try:
+            # Add graph context to system message if available
+            if graph_context and messages:
+                graph_info = self._format_graph_context(graph_context)
+                if messages[0]["role"] == "system":
+                    messages[0]["content"] += f"\n\n### Enhanced Knowledge Graph Context:\n{graph_info}"
+                else:
+                    messages.insert(0, {"role": "system", "content": f"### Knowledge Graph Context:\n{graph_info}"})
+            
+            payload = {
+                "model": self.model,
+                "messages": messages,
+                "stream": False,
+                "options": {
+                    "temperature": kwargs.get("temperature", 0.7),
+                    "top_p": kwargs.get("top_p", 0.9),
+                    "num_ctx": kwargs.get("num_ctx", 4096),
+                    "repeat_penalty": kwargs.get("repeat_penalty", 1.1)
+                }
+            }
+            
+            start_time = datetime.now()
+            response = requests.post(self.chat_url, json=payload, timeout=120)
+            response.raise_for_status()
+            processing_time = (datetime.now() - start_time).total_seconds()
+            
+            result = response.json()
+            content = result.get("message", {}).get("content", "No response from LLM")
+            
+            # Calculate confidence based on response quality
+            confidence = self._calculate_response_confidence(content, graph_context)
+            
+            return content, confidence, processing_time
+            
+        except Exception as e:
+            logger.error(f"⚠️ Enhanced chat generation failed: {str(e)}")
+            return f"Error: {str(e)}", 0.0, 0.0
+    
+    def _format_graph_context(self, graph_context: List[Dict]) -> str:
+        """Format graph context for LLM consumption"""
+        formatted = []
+        for ctx in graph_context[:5]:  # Top 5 contexts
+            concept = ctx.get('concept', 'Unknown')
+            description = ctx.get('description', 'No description')
+            score = ctx.get('score', 0.0)
+            related = ctx.get('related_items', [])
+            
+            formatted.append(f"**{concept}** (relevance: {score:.3f})")
+            formatted.append(f"  Description: {description}")
+            if related:
+                related_names = [item.get('name', '') for item in related[:3]]
+                formatted.append(f"  Related: {', '.join(related_names)}")
+            formatted.append("")
+        
+        return "\n".join(formatted)
+    
+    def _calculate_response_confidence(self, response: str, graph_context: List[Dict] = None) -> float:
+        """Calculate response confidence based on multiple factors"""
+        confidence = 0.5  # Base confidence
+        
+        # Length factor (longer responses often more comprehensive)
+        length_factor = min(len(response) / 500, 1.0) * 0.2
+        confidence += length_factor
+        
+        # Graph context utilization
+        if graph_context:
+            context_concepts = [ctx.get('concept', '').lower() for ctx in graph_context]
+            response_lower = response.lower()
+            concept_mentions = sum(1 for concept in context_concepts if concept in response_lower)
+            context_factor = min(concept_mentions / len(context_concepts), 1.0) * 0.3
+            confidence += context_factor
+        
+        # Technical terms and specificity
+        technical_indicators = ['specification', 'parameter', 'voltage', 'frequency', 'module', 'protocol']
+        tech_mentions = sum(1 for term in technical_indicators if term in response.lower())
+        tech_factor = min(tech_mentions / 3, 1.0) * 0.2
+        confidence += tech_factor
+        
+        return min(confidence, 1.0)
+
+class AdvancedGraphRAGSystem:
+    """Enhanced GraphRAG system with advanced Voyage AI integration"""
+    
+    def __init__(self, db_manager: DatabaseManager):
+        self.faiss_index = None
+        self.metadata = []
+        self.neo4j_driver = None
+        self.vector_index_created = False
+        self.knowledge_graph_created = False
+        self.db_manager = db_manager
+        self.llm = AdvancedOllamaLLM()
+        self.voyage_embeddings_cache = {}
+        self.graph_traversal_history = defaultdict(list)
+        
+    def connect_neo4j(self):
+        """Enhanced Neo4j connection with GraphRAG optimizations"""
+        try:
+            self.neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
+            
+            with self.neo4j_driver.session() as session:
+                result = session.run("RETURN 1 AS test")
+                if result.single()["test"] == 1:
+                    logger.info("✅ Advanced Neo4j connection established")
+                    
+            self.create_advanced_graph_schema()
+            
+        except Exception as e:
+            logger.error(f"⚠️ Neo4j connection failed: {str(e)}")
+            self.neo4j_driver = None
+
+    def create_advanced_graph_schema(self):
+        """Create advanced GraphRAG schema with relationship weights"""
+        if not self.neo4j_driver:
+            return
+            
+        try:
+            with self.neo4j_driver.session() as session:
+                # Enhanced constraints
+                session.run("CREATE CONSTRAINT unique_concept IF NOT EXISTS FOR (c:Concept) REQUIRE c.name IS UNIQUE")
+                session.run("CREATE CONSTRAINT unique_entity IF NOT EXISTS FOR (e:Entity) REQUIRE e.name IS UNIQUE")
+                session.run("CREATE CONSTRAINT unique_document IF NOT EXISTS FOR (d:Document) REQUIRE d.id IS UNIQUE")
+                
+                # Advanced vector indexes
+                try:
+                    session.run("""
+                    CREATE VECTOR INDEX advanced_concept_embeddings IF NOT EXISTS
+                    FOR (c:Concept) ON (c.voyage_embedding)
+                    OPTIONS {
+                        indexConfig: {
+                            `vector.dimensions`: 1024,
+                            `vector.similarity_function`: 'cosine'
+                        }
+                    }
+                    """)
+                    
+                    session.run("""
+                    CREATE VECTOR INDEX document_voyage_embeddings IF NOT EXISTS
+                    FOR (d:Document) ON (d.voyage_embedding)
+                    OPTIONS {
+                        indexConfig: {
+                            `vector.dimensions`: 1024,
+                            `vector.similarity_function`: 'cosine'
+                        }
+                    }
+                    """)
+                except:
+                    pass
+                
+                # Relationship indexes for traversal optimization
+                session.run("CREATE INDEX relationship_strength IF NOT EXISTS FOR ()-[r:RELATES]-() ON (r.strength)")
+                session.run("CREATE INDEX concept_importance IF NOT EXISTS FOR (c:Concept) ON (c.importance)")
+                
+                logger.info("✅ Advanced GraphRAG schema created")
+                self.knowledge_graph_created = True
+                self.vector_index_created = True
+                
+        except Exception as e:
+            logger.error(f"⚠️ Failed to create advanced schema: {str(e)}")
+
+    def advanced_entity_extraction(self, text: str) -> Dict:
+        """Enhanced entity extraction with Voyage AI semantic analysis"""
+        prompt = f"""Analyze this technical text and extract comprehensive knowledge structures.
+Focus on technical specifications, relationships, and semantic connections.
+
+Text: {text[:3000]}
+
+Return a detailed JSON object with this structure:
+{{
+    "concepts": [
+        {{
+            "name": "concept_name",
+            "description": "detailed technical description",
+            "importance": 0.85,
+            "type": "technical|specification|product|protocol",
+            "semantic_tags": ["tag1", "tag2"],
+            "technical_details": {{"param1": "value1"}}
+        }}
+    ],
+    "entities": [
+        {{
+            "name": "entity_name", 
+            "description": "detailed description",
+            "type": "product|component|specification|value",
+            "attributes": {{"attr1": "val1"}}
+        }}
+    ],
+    "relationships": [
+        {{
+            "source": "source_name",
+            "target": "target_name", 
+            "type": "has_specification|operates_at|connects_to|relates_to",
+            "strength": 0.8,
+            "context": "relationship context"
+        }}
+    ],
+    "technical_specifications": [
+        {{
+            "parameter": "voltage",
+            "value": "3.3V",
+            "unit": "volts",
+            "context": "operating voltage"
+        }}
+    ]
+}}"""
+        
+        try:
+            response = self.llm.enhanced_chat_generate([
+                {"role": "system", "content": "You are an expert technical knowledge extractor."},
+                {"role": "user", "content": prompt}
+            ], temperature=0.1)[0]
+            
+            # Extract and parse JSON
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                parsed_data = json.loads(json_match.group())
+                
+                # Ensure all required fields
+                parsed_data.setdefault('concepts', [])
+                parsed_data.setdefault('entities', [])
+                parsed_data.setdefault('relationships', [])
+                parsed_data.setdefault('technical_specifications', [])
+                
+                return parsed_data
+            else:
+                return {"concepts": [], "entities": [], "relationships": [], "technical_specifications": []}
+                
+        except Exception as e:
+            logger.error(f"Advanced entity extraction failed: {str(e)}")
+            return {"concepts": [], "entities": [], "relationships": [], "technical_specifications": []}
+
+    def store_advanced_knowledge_graph(self, knowledge: Dict, source_text: str):
+        """Store knowledge with advanced Voyage AI embeddings"""
+        if not self.neo4j_driver:
+            return
+            
+        try:
+            with self.neo4j_driver.session() as session:
+                # Store concepts with Voyage embeddings
+                for concept in knowledge.get('concepts', []):
+                    try:
+                        concept_text = f"{concept['name']} {concept.get('description', '')}"
+                        
+                        # Generate Voyage AI embedding
+                        if concept_text not in self.voyage_embeddings_cache:
+                            voyage_embedding = client.multimodal_embed(
+                                inputs=[[concept_text]],
+                                model="voyage-multimodal-3",
+                                input_type="document"
+                            ).embeddings[0]
+                            self.voyage_embeddings_cache[concept_text] = voyage_embedding
+                        else:
+                            voyage_embedding = self.voyage_embeddings_cache[concept_text]
+                        
+                        session.run("""
+                        MERGE (c:Concept {name: $name})
+                        SET c.description = $description,
+                            c.importance = $importance,
+                            c.type = $type,
+                            c.voyage_embedding = $voyage_embedding,
+                            c.semantic_tags = $semantic_tags,
+                            c.technical_details = $technical_details,
+                            c.last_mentioned = datetime(),
+                            c.mention_count = coalesce(c.mention_count, 0) + 1,
+                            c.voyage_processed = true
+                        """, {
+                            **concept,
+                            'voyage_embedding': voyage_embedding,
+                            'semantic_tags': concept.get('semantic_tags', []),
+                            'technical_details': json.dumps(concept.get('technical_details', {}))
+                        })
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to store concept {concept.get('name')}: {str(e)}")
+                
+                # Store enhanced entities
+                for entity in knowledge.get('entities', []):
+                    session.run("""
+                    MERGE (e:Entity {name: $name})
+                    SET e.description = $description,
+                        e.type = $type,
+                        e.attributes = $attributes,
+                        e.last_mentioned = datetime(),
+                        e.mention_count = coalesce(e.mention_count, 0) + 1
+                    """, {
+                        **entity,
+                        'attributes': json.dumps(entity.get('attributes', {}))
+                    })
+                
+                # Store enhanced relationships
+                for rel in knowledge.get('relationships', []):
+                    session.run("""
+                    MATCH (source) WHERE source.name = $source
+                    MATCH (target) WHERE target.name = $target
+                    MERGE (source)-[r:RELATES {type: $type}]->(target)
+                    SET r.strength = $strength,
+                        r.context = $context,
+                        r.last_used = datetime(),
+                        r.usage_count = coalesce(r.usage_count, 0) + 1,
+                        r.voyage_enhanced = true
+                    """, rel)
+                
+                # Store technical specifications as separate nodes
+                for spec in knowledge.get('technical_specifications', []):
+                    session.run("""
+                    MERGE (s:Specification {parameter: $parameter})
+                    SET s.value = $value,
+                        s.unit = $unit,
+                        s.context = $context,
+                        s.last_updated = datetime()
+                    """, spec)
+                
+                logger.info(f"✅ Advanced knowledge stored: {len(knowledge.get('concepts', []))} concepts with Voyage embeddings")
+                
+        except Exception as e:
+            logger.error(f"⚠️ Advanced knowledge storage failed: {str(e)}")
+
+    def advanced_graph_traversal(self, query: str, max_depth: int = 3) -> List[Dict]:
+        """Advanced graph traversal with Voyage AI semantic routing"""
+        if not self.neo4j_driver:
+            return []
+            
+        try:
+            # Generate Voyage embedding for query
+            query_embedding = client.multimodal_embed(
+                inputs=[[query]],
+                model="voyage-multimodal-3",
+                input_type="document"
+            ).embeddings[0]
+            
+            with self.neo4j_driver.session() as session:
+                # Multi-hop graph traversal with semantic similarity
+                results = session.run("""
+                CALL db.index.vector.queryNodes('advanced_concept_embeddings', 10, $embedding)
+                YIELD node as start_node, score as start_score
+                
+                // Traverse relationships up to max_depth
+                MATCH path = (start_node)-[:RELATES*1..3]-(connected)
+                WHERE connected.voyage_processed = true
+                
+                WITH start_node, start_score, path, connected,
+                     reduce(strength = 1.0, rel in relationships(path) | strength * rel.strength) as path_strength
+                
+                RETURN DISTINCT
+                    start_node.name as primary_concept,
+                    start_node.description as primary_description, 
+                    start_score,
+                    connected.name as connected_concept,
+                    connected.description as connected_description,
+                    connected.importance as connected_importance,
+                    path_strength,
+                    length(path) as path_length,
+                    [rel in relationships(path) | rel.type] as relationship_types
+                
+                ORDER BY start_score DESC, path_strength DESC, connected_importance DESC
+                LIMIT 15
+                """, {"embedding": query_embedding, "max_depth": max_depth}).data()
+                
+                # Group and rank results
+                graph_context = []
+                for result in results:
+                    context = {
+                        "concept": result["primary_concept"],
+                        "description": result["primary_description"],  
+                        "score": float(result["start_score"]),
+                        "connected_concepts": [{
+                            "name": result["connected_concept"],
+                            "description": result["connected_description"],
+                            "importance": float(result.get("connected_importance", 0.5)),
+                            "path_strength": float(result["path_strength"]),
+                            "path_length": result["path_length"],
+                            "relationship_types": result["relationship_types"]
+                        }] if result["connected_concept"] else [],
+                        "voyage_enhanced": True
+                    }
+                    graph_context.append(context)
+                
+                # Store traversal history for analytics
+                self.graph_traversal_history[query].append({
+                    "timestamp": datetime.now().isoformat(),
+                    "results_count": len(graph_context),
+                    "max_score": max([ctx["score"] for ctx in graph_context]) if graph_context else 0.0
+                })
+                
+                return graph_context
+                
+        except Exception as e:
+            logger.error(f"⚠️ Advanced graph traversal failed: {str(e)}")
+            return []
+
+    def hybrid_voyage_search(self, query: str, top_k: int = 5) -> Dict:
+        """Advanced hybrid search combining Voyage AI embeddings with GraphRAG"""
+        start_time = datetime.now()
+        
+        # Multi-strategy search approach
+        search_results = {
+            "voyage_vector_results": [],
+            "graph_traversal_results": [],
+            "faiss_semantic_results": [],
+            "keyword_matches": [],
+            "combined_results": []
+        }
+        
+        try:
+            # 1. Voyage AI vector search
+            query_embedding = client.multimodal_embed(
+                inputs=[[query]],
+                model="voyage-multimodal-3",
+                input_type="document"
+            ).embeddings[0]
+            
+            if self.neo4j_driver:
+                with self.neo4j_driver.session() as session:
+                    # Search concepts with Voyage embeddings
+                    vector_results = session.run("""
+                    CALL db.index.vector.queryNodes('advanced_concept_embeddings', $top_k, $embedding)
+                    YIELD node, score
+                    RETURN 
+                        node.name as concept,
+                        node.description as description,
+                        score,
+                        node.importance as importance,
+                        node.type as type,
+                        node.semantic_tags as tags
+                    ORDER BY score DESC
+                    """, {"embedding": query_embedding, "top_k": top_k}).data()
+                    
+                    search_results["voyage_vector_results"] = [
+                        {
+                            "concept": r["concept"],
+                            "description": r["description"],
+                            "score": float(r["score"]),
+                            "type": "voyage_vector",
+                            "metadata": {
+                                "importance": r.get("importance", 0.5),
+                                "type": r.get("type", "unknown"),
+                                "tags": r.get("tags", [])
+                            }
+                        } for r in vector_results
+                    ]
+            
+            # 2. Graph traversal search
+            graph_results = self.advanced_graph_traversal(query)
+            search_results["graph_traversal_results"] = [
+                {
+                    "concept": r["concept"],
+                    "description": r["description"],
+                    "score": r["score"],
+                    "type": "graph_traversal",
+                    "metadata": {
+                        "connected_concepts": r["connected_concepts"],
+                        "voyage_enhanced": r.get("voyage_enhanced", False)
+                    }
+                } for r in graph_results[:top_k]
+            ]
+            
+            # 3. Combine and rank results (advanced fusion algorithm)
+            combined = []
+            
+            # Add vector results with high weight
+            for vr in search_results["voyage_vector_results"]:
+                combined.append({
+                    **vr,
+                    "combined_score": vr["score"] * 1.2  # Higher weight for direct matches
+                })
+            
+            # Add graph results with context weighting
+            for gr in search_results["graph_traversal_results"]:
+                context_boost = 1.0 + (0.1 * len(gr["metadata"]["connected_concepts"]))
+                combined.append({
+                    **gr,
+                    "combined_score": gr["score"] * 0.9 * context_boost  # Slightly lower base weight but context boosted
+                })
+            
+            # Sort by combined score and deduplicate
+            seen_concepts = set()
+            final_results = []
+            for item in sorted(combined, key=lambda x: x["combined_score"], reverse=True):
+                if item["concept"] not in seen_concepts:
+                    final_results.append(item)
+                    seen_concepts.add(item["concept"])
+                    if len(final_results) >= top_k:
+                        break
+            
+            search_results["combined_results"] = final_results[:top_k]
+            search_results["processing_time"] = (datetime.now() - start_time).total_seconds()
+            
+            return search_results
+            
+        except Exception as e:
+            logger.error(f"⚠️ Hybrid search failed: {str(e)}")
+            return {
+                "error": str(e),
+                "combined_results": []
+            }
+
+    def process_pdf_document(self, file_path: str):
+        """Advanced PDF processing with multimodal capabilities"""
+        try:
+            doc = fitz.open(file_path)
+            full_text = ""
+            images = []
+            
+            for page_num in range(len(doc)):
+                page = doc.load_page(page_num)
+                full_text += page.get_text()
+                
+                # Extract images for potential multimodal processing
+                for img in page.get_images():
+                    xref = img[0]
+                    base_image = doc.extract_image(xref)
+                    image_bytes = base_image["image"]
+                    image = Image.open(io.BytesIO(image_bytes))
+                    images.append(image)
+            
+            # Enhanced knowledge extraction
+            knowledge = self.advanced_entity_extraction(full_text)
+            self.store_advanced_knowledge_graph(knowledge, full_text)
+            
+            # Process images if needed (placeholder for multimodal)
+            if images:
+                logger.info(f"Extracted {len(images)} images (multimodal processing not implemented)")
+            
+            return {
+                "status": "success",
+                "pages": len(doc),
+                "characters": len(full_text),
+                "concepts_extracted": len(knowledge.get("concepts", [])),
+                "entities_extracted": len(knowledge.get("entities", [])),
+                "relationships_found": len(knowledge.get("relationships", []))
+            }
+            
+        except Exception as e:
+            logger.error(f"⚠️ PDF processing failed: {str(e)}")
+            return {
+                "status": "error",
+                "error": str(e)
+            }
+
+    def generate_response(self, query: str, chat_history: List[Dict] = None) -> Dict:
+        """Enhanced response generation with GraphRAG context"""
+        start_time = datetime.now()
+        chat_history = chat_history or []
+        
+        try:
+            # 1. Perform hybrid search
+            search_results = self.hybrid_voyage_search(query)
+            graph_context = search_results.get("combined_results", [])
+            
+            # 2. Prepare LLM prompt with GraphRAG context
+            messages = [
+                {
+                    "role": "system",
+                    "content": """You are a technical expert assistant with access to a knowledge graph.
+Use the provided GraphRAG context to give accurate, detailed responses. Cite concepts when appropriate."""
+                }
+            ]
+            
+            # Add chat history
+            for msg in chat_history[-6:]:  # Last 3 exchanges
+                messages.append({"role": msg["role"], "content": msg["content"]})
+            
+            # Add current query
+            messages.append({"role": "user", "content": query})
+            
+            # 3. Generate response with confidence scoring
+            response, confidence, processing_time = self.llm.enhanced_chat_generate(
+                messages,
+                graph_context=graph_context,
+                temperature=0.3
+            )
+            
+            # 4. Prepare analytics
+            analytics = {
+                "search_strategy": "hybrid_voyage",
+                "context_used": len(graph_context),
+                "graph_context_used": len([c for c in graph_context if c["type"] == "graph_traversal"]),
+                "voyage_embedding_used": True,
+                "relevance_scores": {c["concept"]: c["score"] for c in graph_context},
+                "extracted_entities": self.advanced_entity_extraction(query).get("entities", []),
+                "graph_paths": [c["metadata"].get("connected_concepts", []) for c in graph_context],
+                "response_confidence": confidence,
+                "processing_time": (datetime.now() - start_time).total_seconds(),
+                "additional_metadata": {
+                    "voyage_version": "multimodal-3",
+                    "graph_depth": 3,
+                    "llm_model": self.llm.model
+                }
+            }
+            
+            return {
+                "response": response,
+                "context": graph_context,
+                "analytics": analytics,
+                "status": "success"
+            }
+            
+        except Exception as e:
+            logger.error(f"⚠️ Response generation failed: {str(e)}")
+            return {
+                "response": f"Error: {str(e)}",
+                "context": [],
+                "analytics": {},
+                "status": "error"
+            }
+
+class StreamlitApp:
+    """Enhanced Streamlit application with advanced GraphRAG features"""
+    
+    def __init__(self):
+        self.db = DatabaseManager()
+        self.graph_rag = AdvancedGraphRAGSystem(self.db)
+        self.current_chat = None
+        self.initialize_session()
+        
+    def initialize_session(self):
+        """Initialize session state with advanced tracking"""
+        if "session_id" not in st.session_state:
+            st.session_state.session_id = str(uuid.uuid4())
+            st.session_state.messages = []
+            st.session_state.analytics = defaultdict(list)
+            st.session_state.uploaded_files = []
+            st.session_state.graph_visualization = None
+            st.session_state.active_tab = "chat"
+            st.session_state.search_results = []
+        
+    def render_sidebar(self):
+        """Enhanced sidebar with analytics and controls"""
+        with st.sidebar:
+            st.title("GraphRAG Controls")
+            
+            # Chat management
+            with st.expander("💬 Chat Sessions", expanded=True):
+                if st.button("➕ New Chat"):
+                    self.create_new_chat()
+                
+                chats = self.db.get_chats()
+                chat_titles = [chat["title"] for chat in chats]
+                selected_chat = st.selectbox(
+                    "Your Chats",
+                    chat_titles,
+                    index=0,
+                    help="Select a chat to continue"
+                )
+                
+                if chats and selected_chat:
+                    self.current_chat = [c for c in chats if c["title"] == selected_chat][0]["id"]
+                    self.load_chat_messages()
+                
+                if st.button("🗑️ Delete Current Chat") and self.current_chat:
+                    if self.db.delete_chat(self.current_chat):
+                        st.success("Chat deleted")
+                        st.experimental_rerun()
+            
+            # Knowledge Graph Status
+            with st.expander("🧠 Knowledge Graph", expanded=True):
+                if st.button("🔄 Connect to Neo4j"):
+                    self.graph_rag.connect_neo4j()
+                    st.experimental_rerun()
+                
+                status = "✅ Connected" if self.graph_rag.neo4j_driver else "❌ Disconnected"
+                st.markdown(f"**Neo4j Status:** {status}")
+                
+                if st.button("📊 Graph Statistics") and self.graph_rag.neo4j_driver:
+                    stats = self.get_graph_statistics()
+                    st.json(stats)
+            
+            # Document Processing
+            with st.expander("📄 Process Documents", expanded=True):
+                uploaded_file = st.file_uploader(
+                    "Upload PDF for GraphRAG",
+                    type=["pdf"],
+                    accept_multiple_files=False
+                )
+                
+                if uploaded_file and st.button("Process Document"):
+                    with st.spinner("Extracting knowledge..."):
+                        # Save temporarily
+                        file_path = os.path.join("/tmp", uploaded_file.name)
+                        with open(file_path, "wb") as f:
+                            f.write(uploaded_file.getbuffer())
+                        
+                        result = self.graph_rag.process_pdf_document(file_path)
+                        if result["status"] == "success":
+                            st.success(f"Processed {result['pages']} pages, extracted {result['concepts_extracted']} concepts")
+                        else:
+                            st.error(f"Processing failed: {result['error']}")
+            
+            # System Monitoring
+            with st.expander("📈 System Metrics", expanded=False):
+                if self.current_chat:
+                    analytics = self.db.get_chat_analytics(self.current_chat)
+                    if analytics:
+                        st.metric("Total Messages", analytics["total_messages"])
+                        st.metric("Avg Confidence", f"{analytics.get('avg_confidence', 0)*100:.1f}%")
+                        st.metric("Graph Usage", f"{analytics.get('avg_graph_usage', 0)*100:.1f}%")
+            
+            st.markdown("---")
+            st.markdown("🛠️ Advanced GraphRAG System v2.0")
+    
+    def get_graph_statistics(self) -> Dict:
+        """Get knowledge graph statistics"""
+        if not self.graph_rag.neo4j_driver:
+            return {}
+            
+        try:
+            with self.graph_rag.neo4j_driver.session() as session:
+                result = session.run("""
+                MATCH (n)
+                WITH labels(n) as labels, count(*) as count
+                RETURN {labels: labels, count: count} as node_counts
+                
+                UNION
+                
+                MATCH ()-[r]->()
+                WITH type(r) as type, count(*) as count
+                RETURN {type: type, count: count} as rel_counts
+                
+                UNION
+                
+                MATCH (c:Concept)
+                RETURN {
+                    total_concepts: count(c),
+                    avg_importance: avg(c.importance),
+                    voyage_processed: count(c.voyage_processed)
+                } as concept_stats
+                """).data()
+                
+                stats = {
+                    "node_counts": [],
+                    "relationship_counts": [],
+                    "concept_stats": {}
+                }
+                
+                for record in result:
+                    data = record["node_counts"] or record["rel_counts"] or record["concept_stats"]
+                    if "labels" in data:
+                        stats["node_counts"].append(data)
+                    elif "type" in data:
+                        stats["relationship_counts"].append(data)
+                    else:
+                        stats["concept_stats"] = data
+                
+                return stats
+                
+        except Exception as e:
+            logger.error(f"Failed to get graph stats: {str(e)}")
+            return {"error": str(e)}
+    
+    def create_new_chat(self):
+        """Create a new chat session"""
+        title = f"Chat {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        chat_id = self.db.create_chat(title)
+        if chat_id:
+            self.current_chat = chat_id
+            st.session_state.messages = []
+            st.experimental_rerun()
+    
+    def load_chat_messages(self):
+        """Load messages for current chat"""
+        if self.current_chat:
+            messages = self.db.get_chat_messages(self.current_chat)
+            st.session_state.messages = [
+                {"role": msg["role"], "content": msg["content"]}
+                for msg in messages
+            ]
+    
+    def render_chat(self):
+        """Enhanced chat interface with GraphRAG features"""
+        st.title("Advanced GraphRAG Chat")
+        
+        # Tabs for different views
+        tabs = ["chat", "context", "analytics"]
+        st.session_state.active_tab = st.radio(
+            "View Mode",
+            tabs,
+            index=tabs.index(st.session_state.get("active_tab", "chat")),
+            horizontal=True,
+            label_visibility="hidden"
+        )
+        
+        # Chat messages display
+        if st.session_state.active_tab == "chat":
+            for msg in st.session_state.messages:
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
+        
+        # Context view
+        elif st.session_state.active_tab == "context" and st.session_state.get("search_results"):
+            st.subheader("GraphRAG Context Used")
+            for result in st.session_state.search_results[:5]:
+                with st.expander(f"🔍 {result['concept']} (score: {result['score']:.3f})"):
+                    st.markdown(f"**Description:** {result['description']}")
+                    if result.get("metadata", {}).get("connected_concepts"):
+                        st.markdown("**Connected Concepts:**")
+                        for conn in result["metadata"]["connected_concepts"][:3]:
+                            st.markdown(f"- {conn['name']} (strength: {conn['path_strength']:.2f})")
+        
+        # Analytics view
+        elif st.session_state.active_tab == "analytics" and self.current_chat:
+            analytics = self.db.get_chat_analytics(self.current_chat)
+            if analytics:
+                st.subheader("Chat Analytics")
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Total Messages", analytics["total_messages"])
+                col2.metric("Avg Confidence", f"{analytics.get('avg_confidence', 0)*100:.1f}%")
+                col3.metric("Graph Usage", f"{analytics.get('avg_graph_usage', 0)*100:.1f}%")
+                
+                st.markdown("**Strategies Used:**")
+                for strategy in analytics.get("strategies_used", []):
+                    st.markdown(f"- {strategy}")
+            else:
+                st.info("No analytics available yet")
+        
+        # User input
+        if prompt := st.chat_input("Ask about technical documents..."):
+            self.process_user_input(prompt)
+    
+    def process_user_input(self, prompt: str):
+        """Process user input with enhanced GraphRAG"""
+        # Add user message to UI and DB
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        if self.current_chat:
+            self.db.add_enhanced_message(self.current_chat, "user", prompt)
+        
+        with st.spinner("Consulting knowledge graph..."):
+            # Generate response with GraphRAG
+            response = self.graph_rag.generate_response(
+                prompt,
+                st.session_state.messages
+            )
+            
+            # Store context for display
+            st.session_state.search_results = response.get("context", [])
+            
+            # Add assistant response
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": response["response"]
+            })
+            
+            # Store in database with analytics
+            if self.current_chat and response.get("analytics"):
+                self.db.add_enhanced_message(
+                    self.current_chat,
+                    "assistant",
+                    response["response"],
+                    response["analytics"]
+                )
+        
+        # Rerun to update UI
+        st.experimental_rerun()
+    
+    def run(self):
+        """Run the enhanced Streamlit application"""
+        self.render_sidebar()
+        self.render_chat()
+
+# Main application
+if __name__ == "__main__":
+    app = StreamlitApp()
+    app.run()
